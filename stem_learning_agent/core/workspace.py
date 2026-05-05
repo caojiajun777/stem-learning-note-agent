@@ -165,6 +165,9 @@ class CourseWorkspace:
     def final_unresolved_path(self) -> Path:
         return self.final_dir / "unresolved_issues.md"
 
+    def final_index_path(self) -> Path:
+        return self.final_dir / "index.md"
+
     # memory/
     def learner_prefs_path(self) -> Path:
         return self.memory_dir / "preferences.json"
