@@ -46,21 +46,76 @@ def _quiz_for_part(markdown: str) -> str:
 def _visual_summary(workspace) -> str:  # type: ignore[no-untyped-def]
     visuals_path = workspace.visual_needs_path()
     if not visuals_path.exists():
-        return "_No visual plan available._"
+        return "> **注意：** visual_needs.json 不存在。请先运行 VisualPlannerAgent。\n\n_No visual plan available._"
     data = io_utils.read_json(visuals_path)
     items = data.get("items", [])
     if not items:
         return "_No visual items planned._"
-    lines = []
+
+    # Group items by part_id for structured output.
+    by_part: dict[str, list[dict]] = {}
     for v in items:
-        lines.append(
-            f"- part {v['part_id']} → `{v['kind']}` — {v['description']}"
-        )
-        if v.get("mermaid_draft"):
-            lines.append("  ```mermaid")
-            for ln in v["mermaid_draft"].splitlines():
-                lines.append(f"  {ln}")
-            lines.append("  ```")
+        by_part.setdefault(v.get("part_id", "unknown"), []).append(v)
+
+    lines: list[str] = [
+        "> **本文件是 Visual TODO 列表，不是已生成的图片。**",
+        "> 每个条目说明某 part 适合画什么图、为什么需要、以及当前置信度。",
+        "> 所有条目 `needs_review=True`：图示类型和描述仅为推荐，需人工确认后再绘制。",
+        "",
+    ]
+
+    # Load part outline for titles.
+    part_titles: dict[str, str] = {}
+    part_outline_path = workspace.part_outline_path()
+    if part_outline_path.exists():
+        outline = io_utils.read_json(part_outline_path)
+        for p in outline.get("parts", []):
+            part_titles[p["id"]] = p.get("title", "")
+
+    for part_id in sorted(by_part):
+        group = by_part[part_id]
+        p_title = part_titles.get(part_id, "")
+        header = f"Part {part_id}"
+        if p_title:
+            header += f": {p_title}"
+        lines.append(f"## {header}")
+        lines.append("")
+        for i, v in enumerate(group, start=1):
+            kind = v.get("kind", "unknown")
+            title = v.get("title") or f"Visual {i}"
+            desc = v.get("description", "")
+            reason = v.get("reason") or "(reason not specified)"
+            conf = v.get("confidence", 0.5)
+            nr = v.get("needs_review", True)
+            source_type = v.get("source_type", "part")
+            formula_ids = v.get("related_formula_ids", []) or []
+            example_ids = v.get("related_example_ids", []) or []
+            mermaid = v.get("mermaid_draft")
+
+            lines.append(f"### Visual {i}: {title}")
+            lines.append("")
+            lines.append(f"- **Type:** `{kind}`")
+            lines.append(f"- **Source type:** `{source_type}`")
+            lines.append(f"- **Why needed:** {reason}")
+            lines.append(f"- **Description:** {desc}")
+            if formula_ids:
+                lines.append(f"- **Related formulas:** {', '.join(formula_ids)}")
+            if example_ids:
+                lines.append(f"- **Related examples:** {', '.join(example_ids)}")
+            lines.append(f"- **Confidence:** {conf:.2f}")
+            nr_marker = " (需要人工确认后再绘制)" if nr else ""
+            lines.append(f"- **Needs review:** {'yes' if nr else 'no'}{nr_marker}")
+            if mermaid:
+                lines.append("")
+                lines.append("```mermaid")
+                for ln in mermaid.splitlines():
+                    lines.append(ln.strip())
+                lines.append("```")
+            lines.append("")
+        lines.append("")
+
+    lines.append("> **以上全部为 visual TODO，未生成任何实际教学图。**")
+    lines.append("> 请根据各条目描述，由人工或图像生成工具后续绘制。")
     return "\n".join(lines)
 
 

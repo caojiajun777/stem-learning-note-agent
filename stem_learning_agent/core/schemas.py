@@ -210,6 +210,14 @@ class VisualPlanItem(BaseModel):
     description: str
     mermaid_draft: Optional[str] = None
     needs_review: bool = True
+    # New optional fields for richer visual planning (Task 05).
+    source_type: Literal["part", "formula", "example", "concept"] = "part"
+    title: str = ""
+    reason: str = ""
+    source_refs: list[SourceRef] = Field(default_factory=list)
+    related_formula_ids: list[str] = Field(default_factory=list)
+    related_example_ids: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 class VisualNeeds(BaseModel):
