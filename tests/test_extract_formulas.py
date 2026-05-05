@@ -47,3 +47,17 @@ def test_empty_prose_yields_warning() -> None:
     result = ExtractFormulasTool().run(chunks=[chunk])
     assert result.data == []
     assert result.warnings  # extractor should warn explicitly
+
+
+def test_paren_inline_latex_captured() -> None:
+    """`\\( ... \\)` Pandoc-style inline math must be captured too."""
+    chunk = _chunk(r"The impedance is \(Z_C = 1/(j\omega C)\) in ohms.")
+    result = ExtractFormulasTool().run(chunks=[chunk])
+    assert any("Z_C" in f.plain_text for f in result.data)
+
+
+def test_bracket_display_latex_captured() -> None:
+    r"""`\[ ... \]` Pandoc-style display math must be captured too."""
+    chunk = _chunk(r"Then \[H(j\omega) = 1/(1 + j\omega R C)\] is the response.")
+    result = ExtractFormulasTool().run(chunks=[chunk])
+    assert any("H(j" in f.plain_text for f in result.data)

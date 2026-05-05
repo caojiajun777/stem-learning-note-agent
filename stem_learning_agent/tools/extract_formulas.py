@@ -2,6 +2,7 @@
 
 MVP heuristics:
 - LaTeX inline `$...$` and display `$$...$$` blocks.
+- LaTeX inline `\\(...\\)` and display `\\[...\\]` blocks.
 - Lines containing common math operators with variable-style identifiers.
 
 Anything extracted has `confidence < 0.85` and `needs_review=True` because
@@ -17,6 +18,9 @@ from ..harness.tool_base import Tool, ToolResult
 
 _INLINE_LATEX = re.compile(r"\$([^$\n]{1,200})\$")
 _DISPLAY_LATEX = re.compile(r"\$\$([\s\S]{2,400}?)\$\$")
+# Additional LaTeX math delimiters common in converted Markdown / Pandoc output.
+_PAREN_INLINE_LATEX = re.compile(r"\\\(([^\n]{1,200}?)\\\)")
+_BRACKET_DISPLAY_LATEX = re.compile(r"\\\[([\s\S]{2,400}?)\\\]")
 _FORMULA_LINE = re.compile(
     r"^[A-Za-z_][\w\(\)]*\s*=\s*[^=].*$"
 )  # very lenient
@@ -81,6 +85,11 @@ def _iter_candidates(chunks: Iterable[ParsedChunk]) -> list[tuple[ParsedChunk, s
             if not _has_math_signal(latex):
                 continue
             out.append((ch, latex, latex))
+        for m in _BRACKET_DISPLAY_LATEX.finditer(ch.text):
+            latex = m.group(1).strip()
+            if not _has_math_signal(latex):
+                continue
+            out.append((ch, latex, latex))
         for inner in _all_inline_latex(ch.text):
             latex = inner.strip()
             # avoid double-count when display already matched
@@ -89,9 +98,20 @@ def _iter_candidates(chunks: Iterable[ParsedChunk]) -> list[tuple[ParsedChunk, s
             if not _has_math_signal(latex):
                 continue
             out.append((ch, latex, latex))
+        for m in _PAREN_INLINE_LATEX.finditer(ch.text):
+            latex = m.group(1).strip()
+            if not _has_math_signal(latex):
+                continue
+            out.append((ch, latex, latex))
         for line in ch.text.splitlines():
             line = line.strip()
-            if _FORMULA_LINE.match(line) and "$" not in line and _has_math_signal(line):
+            if (
+                _FORMULA_LINE.match(line)
+                and "$" not in line
+                and "\\(" not in line
+                and "\\[" not in line
+                and _has_math_signal(line)
+            ):
                 out.append((ch, "", line))
     return out
 
