@@ -23,7 +23,7 @@ class ExampleTutorAgent(Agent):
 
         chunks = [c for d in parsed for c in d.chunks]
         ext = ctx.tools.get("extract_examples")
-        ex_result = ext.run(chunks=chunks)
+        ex_result = ext.run(chunks=chunks, llm=ctx.llm)
         examples = ex_result.data
         io_utils.write_json(
             ctx.workspace.examples_path(),
@@ -31,7 +31,7 @@ class ExampleTutorAgent(Agent):
         )
 
         match = ctx.tools.get("match_examples")
-        match_result = match.run(examples=examples, parts=outline.parts)
+        match_result = match.run(examples=examples, parts=outline.parts, llm=ctx.llm)
         matching = match_result.data
         io_utils.write_json(
             ctx.workspace.example_matching_path(), matching.model_dump()
