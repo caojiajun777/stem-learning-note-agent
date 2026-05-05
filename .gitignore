@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local secrets
+.env
+.env.*
+
+# Generated workspaces (keep raw, ignore generated)
+samples/*/parsed/
+samples/*/planning/
+samples/*/drafts/
+samples/*/review/
+samples/*/final/
+samples/*/memory/
+samples/*/pipeline_run.json
