@@ -177,6 +177,10 @@ class PrerequisiteConcept(BaseModel):
     concept: str
     kind: PrereqKind
     why: str = ""
+    # New optional fields for richer prerequisite metadata (Task 06).
+    source_refs: list[SourceRef] = Field(default_factory=list)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    needs_review: bool = True
 
 
 class PrerequisiteGraph(BaseModel):
