@@ -15,6 +15,7 @@ from typing import Iterable
 
 from ..core.schemas import Formula, ParsedChunk, SourceRef
 from ..harness.tool_base import Tool, ToolResult
+from .text_quality import is_garbled_math_text
 
 _INLINE_LATEX = re.compile(r"\$([^$\n]{1,200})\$")
 _DISPLAY_LATEX = re.compile(r"\$\$([\s\S]{2,400}?)\$\$")
@@ -129,6 +130,16 @@ class ExtractFormulasTool(Tool):
                 continue
             seen.add(key)
             fid = f"f{len(formulas):03d}"
+            is_garbled = is_garbled_math_text(plain)
+            confidence = 0.25 if is_garbled else 0.6
+            assumptions: list[str] = []
+            if is_garbled:
+                from .text_quality import formula_noise_reasons
+
+                assumptions.append(
+                    "garbled_math_text_detected: "
+                    + "; ".join(formula_noise_reasons(plain))
+                )
             formulas.append(
                 Formula(
                     id=fid,
@@ -140,7 +151,8 @@ class ExtractFormulasTool(Tool):
                             chunk_id=chunk.id,
                         )
                     ],
-                    confidence=0.6,
+                    assumptions=assumptions,
+                    confidence=confidence,
                     needs_review=True,
                 )
             )

@@ -98,11 +98,30 @@ def _build_revision_notes(
     sl.append("## 核心公式 / Key Formulas")
     sl.append("")
     if formulas_data:
-        for f in formulas_data[:20]:
+        suppressed = 0
+        shown = 0
+        for f in formulas_data:
+            conf = f.get("confidence", 0)
+            assumptions = f.get("assumptions", [])
+            is_garbled = any(
+                "garbled_math_text_detected" in a for a in (assumptions or [])
+            )
+            # Suppress garbled or very-low-confidence formulas.
+            if is_garbled or conf < 0.5:
+                suppressed += 1
+                continue
+            if shown >= 20:
+                break
             txt = f.get("plain_text", "") or f.get("latex", "") or f.get("id", "?")
             nr = " `⚠`" if f.get("needs_review") else ""
-            conf = f.get("confidence", 0)
             sl.append(f"- `{txt}` (conf={conf:.2f}){nr}")
+            shown += 1
+        if suppressed:
+            sl.append(
+                f"\n> {suppressed} formula candidate(s) were suppressed from "
+                "this section because they appear garbled or low-confidence. "
+                "See `final/unresolved_issues.md` for the full list."
+            )
     else:
         sl.append("- _(公式列表尚需补充)_")
     sl.append("")
