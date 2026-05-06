@@ -21,6 +21,7 @@ from stem_learning_agent.core.errors import (
 from stem_learning_agent.llm.deepseek_provider import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
+    DEFAULT_THINKING_BUDGET,
     DEFAULT_THINKING_INTENSITY,
     DeepSeekConfig,
     DeepSeekProvider,
@@ -46,10 +47,14 @@ def test_config_from_env_uses_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
     monkeypatch.delenv("DEEPSEEK_MODEL", raising=False)
     monkeypatch.delenv("DEEPSEEK_THINKING_INTENSITY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_THINKING_BUDGET", raising=False)
+    monkeypatch.delenv("DEEPSEEK_DISABLE_THINKING_FOR_JSON", raising=False)
     cfg = DeepSeekConfig.from_env()
     assert cfg.base_url == DEFAULT_BASE_URL
     assert cfg.model == DEFAULT_MODEL
     assert cfg.thinking_intensity == DEFAULT_THINKING_INTENSITY
+    assert cfg.thinking_budget == DEFAULT_THINKING_BUDGET
+    assert cfg.disable_thinking_for_json is True
 
 
 def test_config_from_env_honours_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -57,6 +62,8 @@ def test_config_from_env_honours_overrides(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://example.test/")
     monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
     monkeypatch.setenv("DEEPSEEK_THINKING_INTENSITY", "max")
+    monkeypatch.setenv("DEEPSEEK_THINKING_BUDGET", "1234")
+    monkeypatch.setenv("DEEPSEEK_DISABLE_THINKING_FOR_JSON", "0")
     monkeypatch.setenv("DEEPSEEK_TIMEOUT_SECONDS", "30")
     monkeypatch.setenv("DEEPSEEK_MAX_TOKENS", "256")
     monkeypatch.setenv("DEEPSEEK_TEMPERATURE", "0.1")
@@ -64,6 +71,8 @@ def test_config_from_env_honours_overrides(monkeypatch: pytest.MonkeyPatch) -> N
     assert cfg.base_url == "https://example.test"  # trailing slash stripped
     assert cfg.model == "deepseek-v4-pro"
     assert cfg.thinking_intensity == "max"
+    assert cfg.thinking_budget == 1234
+    assert cfg.disable_thinking_for_json is False
     assert cfg.timeout_seconds == 30
     assert cfg.max_tokens == 256
     assert cfg.temperature == pytest.approx(0.1)
@@ -86,19 +95,12 @@ def test_payload_contains_model_and_messages() -> None:
     assert msgs[-1] == {"role": "user", "content": "hello"}
 
 
-def test_payload_contains_thinking_intensity_max() -> None:
+def test_payload_contains_thinking_for_free_form() -> None:
     payload = build_payload(_cfg(), prompt="hi")
-    # Centralised in `_build_thinking_field`. Both alias keys must carry
-    # an indication of "max" intensity so config changes are localised.
-    serialised = json.dumps(payload)
-    assert "max" in serialised
-    assert "thinking" in payload or "reasoning" in payload
-    # spec requires at least one of these to surface "max"
-    found_max = False
-    for key in ("thinking", "reasoning"):
-        if key in payload and "max" in json.dumps(payload[key]):
-            found_max = True
-    assert found_max, payload
+    # Free-form (no response_format) must include thinking with type="enabled".
+    assert "thinking" in payload
+    assert payload["thinking"]["type"] == "enabled"
+    assert isinstance(payload["thinking"]["budget"], int)
 
 
 def test_payload_never_contains_api_key() -> None:
@@ -130,6 +132,46 @@ def test_payload_response_format_optional() -> None:
     assert "response_format" not in payload
     payload2 = build_payload(cfg, prompt="x", response_format={"type": "json_object"})
     assert payload2["response_format"] == {"type": "json_object"}
+
+
+def test_payload_json_response_format_disables_thinking_by_default() -> None:
+    payload = build_payload(
+        _cfg(),
+        prompt="return json",
+        response_format={"type": "json_object"},
+    )
+    assert "thinking" not in payload
+    assert "reasoning" not in payload
+
+
+def test_payload_non_json_still_includes_thinking() -> None:
+    payload = build_payload(_cfg(), prompt="teach freely")
+    assert payload["thinking"]["type"] == "enabled"
+
+
+def test_payload_json_can_keep_thinking_when_env_disabled() -> None:
+    cfg = _cfg()
+    cfg.disable_thinking_for_json = False
+    payload = build_payload(
+        cfg,
+        prompt="return json",
+        response_format={"type": "json_object"},
+    )
+    assert payload["thinking"]["type"] == "enabled"
+
+
+def test_payload_uses_configured_thinking_budget() -> None:
+    cfg = _cfg()
+    cfg.thinking_budget = 2048
+    payload = build_payload(cfg, prompt="teach freely")
+    assert payload["thinking"]["budget"] == 2048
+
+
+def test_payload_never_contains_user_id() -> None:
+    payload = build_payload(_cfg(), prompt="hi")
+    serialised = json.dumps(payload)
+    assert "user_id" not in serialised
+    assert payload.get("metadata", {}).get("user_id") is None
 
 
 def test_key_fingerprint_does_not_leak_key() -> None:

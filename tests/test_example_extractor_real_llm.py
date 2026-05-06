@@ -253,6 +253,8 @@ def test_extract_examples_safe_fallback_on_repeated_failure() -> None:
     # Fallback does NOT fabricate concepts/formulas.
     assert e.related_concepts == []
     assert e.required_formulas == []
+    # Fallback marker must be present.
+    assert any("llm_example_unavailable" in a for a in e.assumptions)
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +273,7 @@ def test_extract_examples_provider_exception_falls_back() -> None:
     assert len(examples) == 1
     assert examples[0].needs_review is True
     assert examples[0].confidence <= 0.4
+    assert any("llm_example_unavailable" in a for a in examples[0].assumptions)
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +490,251 @@ def test_example_tutor_agent_integration(sample_course_path: Path) -> None:
     # Verify example_matching.json exists.
     matching_path = CourseWorkspace(sample_course_path).example_matching_path()
     assert matching_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# 15. Env isolation: mock path unchanged even with deepseek env set
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_mock_path_env_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_isolate_llm_env fixture (conftest) clears STEM_AGENT_LLM_PROVIDER.
+    This test verifies ExtractExamplesTool.run(llm=None) is heuristic-only
+    regardless of whatever is in the env (the autouse fixture already cleared it,
+    but we also set it here to be explicit).
+    """
+    monkeypatch.setenv("STEM_AGENT_LLM_PROVIDER", "deepseek")
+    # Pass llm=None explicitly — must stay on heuristic path.
+    chunks = [_chunk("Example: Compute f_c.")]
+    tool = ExtractExamplesTool()
+    result = tool.run(chunks=chunks, llm=None)
+    # No network call — heuristic path should return a candidate.
+    assert result.ok
+    assert len(result.data) == 1
+    assert result.data[0].needs_review is True
+
+
+# ---------------------------------------------------------------------------
+# 16. Match max-pairs limit: LLM called at most K times
+# ---------------------------------------------------------------------------
+
+
+def test_match_examples_respects_max_pairs_cap() -> None:
+    """With 20 candidate pairs and max_llm_pairs=3, LLM called at most 3 times."""
+    from stem_learning_agent.tools.match_examples import MatchExamplesTool
+
+    # Build 10 examples and 2 parts → up to 20 (ex, part) pairs above threshold.
+    examples = [
+        ExampleProblem(
+            id=f"ex{i:03d}",
+            problem_text=f"Compute signal{i} for filter{i}.",
+            related_concepts=["signal", "filter"],
+            source_refs=[SourceRef(material_id="m", chunk_id=f"c{i}")],
+        )
+        for i in range(10)
+    ]
+    parts = [
+        LearningPart(
+            id="001", title="Signal filter", core_question="How do filters work?",
+            concepts=["signal", "filter"],
+        ),
+        LearningPart(
+            id="002", title="Signal processing", core_question="How do we process signals?",
+            concepts=["signal", "processing"],
+        ),
+    ]
+    llm_response = json.dumps({
+        "matches": [{
+            "example_id": "ex000", "part_id": "001",
+            "is_relevant": True, "confidence_adjustment": 0.05,
+        }]
+    })
+    provider = _ScriptedProvider(responder=lambda p, i: llm_response)
+    tool = MatchExamplesTool()
+    # Force heuristic scores to be low (< 0.3) so pairs qualify for LLM refinement,
+    # then cap at max_llm_pairs=3.
+    tool.run(examples=examples, parts=parts, threshold=0.01, llm=provider, max_llm_pairs=3)
+    # LLM called at most 3 times, not 20.
+    assert len(provider.calls) <= 3
+
+
+def test_match_examples_max_pairs_zero_skips_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """STEM_AGENT_LLM_MATCH_MAX_PAIRS=0 → no LLM calls, heuristic only."""
+    from stem_learning_agent.tools.match_examples import MatchExamplesTool
+
+    monkeypatch.setenv("STEM_AGENT_LLM_MATCH_MAX_PAIRS", "0")
+    ex = ExampleProblem(
+        id="ex001",
+        problem_text="Compute the cutoff frequency.",
+        related_concepts=["cutoff"],
+        source_refs=[SourceRef(material_id="m", chunk_id="c1")],
+    )
+    part = LearningPart(
+        id="001", title="Cutoff frequency", core_question="What is cutoff?",
+        concepts=["cutoff", "frequency"],
+    )
+    provider = _ScriptedProvider(responder=lambda p, i: "{}")
+    tool = MatchExamplesTool()
+    result = tool.run(examples=[ex], parts=[part], threshold=0.01, llm=provider)
+    assert len(provider.calls) == 0, "no LLM calls expected when max_pairs=0"
+    assert result.ok
+    assert any("STEM_AGENT_LLM_MATCH_MAX_PAIRS=0" in w for w in result.warnings)
+
+
+# ---------------------------------------------------------------------------
+# 17. Provider timeout for one pair does not abort the rest
+# ---------------------------------------------------------------------------
+
+
+def test_match_examples_timeout_on_one_pair_does_not_abort() -> None:
+    """One pair timing out must not prevent other pairs from being matched."""
+    from stem_learning_agent.tools.match_examples import MatchExamplesTool
+
+    call_count = {"n": 0}
+
+    def _raise_on_first(prompt: str, call_index: int) -> str:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("simulated timeout for first pair")
+        return json.dumps({
+            "matches": [{
+                "example_id": "ex001", "part_id": "002",
+                "is_relevant": True, "confidence_adjustment": 0.1,
+            }]
+        })
+
+    examples = [
+        ExampleProblem(
+            id="ex000",
+            problem_text="Compute signal X.",
+            related_concepts=["signal"],
+            source_refs=[SourceRef(material_id="m", chunk_id="c0")],
+        ),
+        ExampleProblem(
+            id="ex001",
+            problem_text="Compute signal Y.",
+            related_concepts=["signal"],
+            source_refs=[SourceRef(material_id="m", chunk_id="c1")],
+        ),
+    ]
+    parts = [
+        LearningPart(
+            id="001", title="Signal processing", core_question="?",
+            concepts=["signal"],
+        ),
+        LearningPart(
+            id="002", title="Signal filtering", core_question="?",
+            concepts=["signal"],
+        ),
+    ]
+    provider = _ScriptedProvider(responder=_raise_on_first)
+    tool = MatchExamplesTool()
+    result = tool.run(
+        examples=examples, parts=parts, threshold=0.01,
+        llm=provider, max_llm_pairs=4,
+    )
+    # Despite the first pair failing, the tool must not raise and must return ok.
+    assert result.ok
+    # example_matching still has some matches from the heuristic path.
+    assert result.data is not None
+
+
+def test_match_examples_output_written_after_timeout(sample_course_path: Path) -> None:
+    """example_matching.json is written even when LLM fails for all pairs."""
+    cfg = RunConfig(course_path=sample_course_path)
+    orch = Orchestrator(cfg)
+    orch.init()
+
+    from stem_learning_agent.agents.curriculum_mapper_agent import CurriculumMapperAgent
+    from stem_learning_agent.agents.example_tutor_agent import ExampleTutorAgent
+    from stem_learning_agent.agents.material_parser_agent import MaterialParserAgent
+
+    MaterialParserAgent().run(orch.ctx)
+    CurriculumMapperAgent().run(orch.ctx)
+
+    orch.ctx.llm = _ScriptedProvider(raise_on_call=RuntimeError("all LLM calls fail"))
+    ExampleTutorAgent().run(orch.ctx)
+
+    matching_path = CourseWorkspace(sample_course_path).example_matching_path()
+    assert matching_path.exists(), "example_matching.json must be written even on LLM failure"
+
+
+# ---------------------------------------------------------------------------
+# 18. Long reason from LLM is truncated, not a schema error
+# ---------------------------------------------------------------------------
+
+
+def test_match_examples_long_reason_truncated_not_schema_error() -> None:
+    """LLM returning a reason > 200 chars should not cause schema_validation_failed."""
+    from stem_learning_agent.tools.match_examples import MatchExamplesTool
+
+    long_reason = "x" * 500  # deliberately exceeds max_length=200
+    llm_response = json.dumps({
+        "matches": [{
+            "example_id": "ex001",
+            "part_id": "001",
+            "is_relevant": True,
+            "confidence_adjustment": 0.1,
+            "reason": long_reason,
+        }]
+    })
+    # Use text with minimal overlap so heuristic score < 0.3 → pair qualifies for LLM.
+    # "frequency response" vs "Convolution theorem" / concepts=[convolution, impulse, frequency]
+    # → only "frequency" overlaps → score ~0.18, well below 0.3.
+    ex = ExampleProblem(
+        id="ex001",
+        problem_text="Determine the frequency response of this RC filter circuit.",
+        related_concepts=[],
+        source_refs=[SourceRef(material_id="m", chunk_id="c1")],
+    )
+    part = LearningPart(
+        id="001", title="Convolution theorem",
+        core_question="How does convolution work?",
+        concepts=["convolution", "impulse", "frequency"],
+    )
+    provider = _ScriptedProvider(responder=lambda p, i: llm_response)
+    tool = MatchExamplesTool()
+    result = tool.run(examples=[ex], parts=[part], threshold=0.01, llm=provider, max_llm_pairs=5)
+    # At least 1 LLM call (reason truncated before validation, no retry needed).
+    assert len(provider.calls) >= 1, f"expected at least 1 call, got {len(provider.calls)}"
+    assert result.ok
+    # The match should exist with a truncated reason.
+    if result.data.matches:
+        m = result.data.matches[0]
+        assert len(m.reason) <= 200 + len("LLM-refined: ")
+
+
+# ---------------------------------------------------------------------------
+# 19. Full pipeline completes even when example LLM always fails
+# ---------------------------------------------------------------------------
+
+
+def test_full_pipeline_example_llm_fails_still_completes(
+    sample_course_path: Path,
+) -> None:
+    """Pipeline must reach status='completed' even when ExampleTutorAgent falls back."""
+    cfg = RunConfig(course_path=sample_course_path)
+    orch = Orchestrator(cfg)
+    orch.init()
+
+    orch.ctx.llm = _ScriptedProvider(raise_on_call=RuntimeError("simulated API outage"))
+    run = orch.run_full()
+
+    assert run.status == "completed", f"Expected completed, got {run.status}"
+    examples_path = orch.workspace.examples_path()
+    assert examples_path.exists(), "parsed/examples.json must exist even on LLM failure"
+    matching_path = orch.workspace.example_matching_path()
+    assert matching_path.exists(), "planning/example_matching.json must exist even on LLM failure"
+    raw_examples = io_utils.read_json(examples_path)
+    assert isinstance(raw_examples, list)
+    for entry in raw_examples:
+        assert entry.get("needs_review") is True
+        assert any(
+            "llm_example_unavailable" in a for a in (entry.get("assumptions") or [])
+        ), f"example {entry.get('id')} missing fallback marker; assumptions={entry.get('assumptions')}"
+    assert orch.workspace.final_full_notes_path().exists()
+    assert orch.workspace.final_revision_notes_path().exists()
+    assert orch.workspace.final_index_path().exists()
 
 
 if __name__ == "__main__":  # pragma: no cover

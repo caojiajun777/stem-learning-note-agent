@@ -138,6 +138,7 @@ class ExampleProblem(BaseModel):
     source_refs: list[SourceRef] = Field(default_factory=list)
     related_concepts: list[str] = Field(default_factory=list)
     required_formulas: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
     difficulty: Difficulty = "unknown"
     solution_available: bool = False
     parsed_solution: Optional[str] = None

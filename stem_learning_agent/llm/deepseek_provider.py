@@ -5,10 +5,12 @@ they go through `LLMProvider` via `provider_factory.get_llm_provider`.
 
 Config comes from env vars (see README §"Enabling DeepSeek") and has
 defaults:
-    DEEPSEEK_BASE_URL           https://api.deepseek.com
-    DEEPSEEK_MODEL              deepseek-v4-pro
-    DEEPSEEK_THINKING_INTENSITY max
-    DEEPSEEK_API_KEY            (required; no default)
+    DEEPSEEK_BASE_URL                    https://api.deepseek.com
+    DEEPSEEK_MODEL                       deepseek-v4-pro
+    DEEPSEEK_THINKING_INTENSITY          max
+    DEEPSEEK_THINKING_BUDGET             4096
+    DEEPSEEK_DISABLE_THINKING_FOR_JSON   true (omit thinking when response_format=json_object)
+    DEEPSEEK_API_KEY                     (required; no default)
 
 The thinking-intensity payload shape is centralised in
 `_build_thinking_field`. If DeepSeek changes the official field name,
@@ -46,6 +48,8 @@ log = get_logger(__name__)
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-pro"
 DEFAULT_THINKING_INTENSITY = "max"
+DEFAULT_THINKING_BUDGET = 4096
+DEFAULT_DISABLE_THINKING_FOR_JSON = True
 DEFAULT_TIMEOUT_SECONDS = 60
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.3
@@ -59,6 +63,8 @@ class DeepSeekConfig:
     base_url: str = DEFAULT_BASE_URL
     model: str = DEFAULT_MODEL
     thinking_intensity: str = DEFAULT_THINKING_INTENSITY
+    thinking_budget: int = DEFAULT_THINKING_BUDGET
+    disable_thinking_for_json: bool = DEFAULT_DISABLE_THINKING_FOR_JSON
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     max_tokens: int = DEFAULT_MAX_TOKENS
     temperature: float = DEFAULT_TEMPERATURE
@@ -78,6 +84,12 @@ class DeepSeekConfig:
             model=e.get("DEEPSEEK_MODEL", DEFAULT_MODEL),
             thinking_intensity=e.get(
                 "DEEPSEEK_THINKING_INTENSITY", DEFAULT_THINKING_INTENSITY
+            ),
+            thinking_budget=_int_env(e, "DEEPSEEK_THINKING_BUDGET", DEFAULT_THINKING_BUDGET),
+            disable_thinking_for_json=_bool_env(
+                e,
+                "DEEPSEEK_DISABLE_THINKING_FOR_JSON",
+                DEFAULT_DISABLE_THINKING_FOR_JSON,
             ),
             timeout_seconds=_int_env(e, "DEEPSEEK_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
             max_tokens=_int_env(e, "DEEPSEEK_MAX_TOKENS", DEFAULT_MAX_TOKENS),
@@ -105,6 +117,13 @@ def _float_env(env: dict[str, str], name: str, default: float) -> float:
         return default
 
 
+def _bool_env(env: dict[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _key_fingerprint(api_key: str) -> str:
     """Return a non-sensitive fingerprint for log lines (never the key itself)."""
     if not api_key:
@@ -126,19 +145,24 @@ def _truncate_for_log(text: str, limit: int = 120) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _build_thinking_field(intensity: str) -> dict[str, Any]:
+def _build_thinking_field(intensity: str, budget: int = DEFAULT_THINKING_BUDGET) -> dict[str, Any]:
     """Return the sub-dict that toggles extended thinking for DeepSeek V4.
 
-    Keep this isolated: if DeepSeek renames the field (e.g. ``thinking`` vs
-    ``reasoning``) or changes intensity levels, the change is one-line here.
+    Keep this isolated: if DeepSeek renames the field or changes intensity
+    levels, the change is one-line here.
     """
-    # We send both ``thinking`` and ``reasoning`` alias keys so that if the
-    # server silently ignores one, the other still applies. Providers that
-    # reject unknown fields will need this narrowed — see README.
+    # DeepSeek V4 API requires ``thinking.type = "enabled"`` plus an
+    # intensity/budget parameter. The exact field name may vary by version.
     return {
-        "thinking": {"enabled": True, "intensity": intensity},
-        "reasoning": {"effort": intensity},
+        "thinking": {
+            "type": "enabled",
+            "budget": budget,  # token budget for extended thinking
+        },
     }
+
+
+def _is_json_object_response_format(response_format: Optional[dict[str, Any]]) -> bool:
+    return isinstance(response_format, dict) and response_format.get("type") == "json_object"
 
 
 def build_payload(
@@ -169,9 +193,13 @@ def build_payload(
         "max_tokens": config.max_tokens if max_tokens is None else max_tokens,
         "stream": False,
     }
-    body.update(_build_thinking_field(config.thinking_intensity))
     if response_format is not None:
         body["response_format"] = response_format
+    if not (
+        config.disable_thinking_for_json
+        and _is_json_object_response_format(response_format)
+    ):
+        body.update(_build_thinking_field(config.thinking_intensity, config.thinking_budget))
     return body
 
 
@@ -296,9 +324,23 @@ class DeepSeekProvider(LLMProvider):
             )
         first = choices[0] or {}
         message = first.get("message") or {}
-        text = message.get("content") or first.get("text") or ""
+        text = message.get("content") or ""
+        # Fallback: in thinking/chain-of-thought mode, the model may emit
+        # ``reasoning_content`` instead of ``content`` (or the content may be
+        # empty if max_tokens was exhausted during reasoning).
+        if (not text or not text.strip()) and message.get("reasoning_content"):
+            text = message["reasoning_content"]
+            # reasoning_content is the model's internal thought process, not
+            # the final answer — mark it so callers can distinguish.
+            if isinstance(text, str) and text.strip():
+                return f"[reasoning_content fallback]\n{text}"
         if not isinstance(text, str) or text.strip() == "":
-            raise LLMEmptyResponseError("DeepSeek response had empty message content.")
+            finish = first.get("finish_reason", "?")
+            raise LLMEmptyResponseError(
+                f"DeepSeek response had empty message content. "
+                f"finish_reason={finish}. "
+                "Increase max_tokens if thinking exhausted the budget."
+            )
         return text
 
     @staticmethod

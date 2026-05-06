@@ -6,6 +6,34 @@ from pathlib import Path
 import pytest
 
 
+# ---------------------------------------------------------------------------
+# Env isolation: clear LLM provider env vars so offline tests always use mock
+# even when the developer's shell has STEM_AGENT_LLM_PROVIDER=deepseek set.
+# ---------------------------------------------------------------------------
+
+_LLM_ENV_VARS = (
+    "STEM_AGENT_LLM_PROVIDER",
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_MODEL",
+    "DEEPSEEK_BASE_URL",
+    "DEEPSEEK_THINKING_INTENSITY",
+    "DEEPSEEK_THINKING_BUDGET",
+    "DEEPSEEK_DISABLE_THINKING_FOR_JSON",
+    "DEEPSEEK_TIMEOUT_SECONDS",
+    "DEEPSEEK_MAX_TOKENS",
+    "DEEPSEEK_TEMPERATURE",
+    "RUN_DEEPSEEK_INTEGRATION_TESTS",
+    "STEM_AGENT_LLM_MATCH_MAX_PAIRS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove LLM provider env vars for every test so mock is always the default."""
+    for var in _LLM_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def sample_course_path(tmp_path: Path) -> Path:
     """Materialise a tiny RC-filter style course in a tmp dir."""

@@ -135,9 +135,9 @@ def test_formula_mock_path_unchanged(sample_course_path: Path) -> None:
     for f in formulas:
         assert f.source_refs, f"formula {f.id} lost source_refs"
         assert f.needs_review is True
-    # Mock path leaves the assumption list heuristic-free (no "llm_enrichment_unavailable").
+    # Mock path leaves the assumption list heuristic-free (no "llm_formula_unavailable").
     for f in formulas:
-        assert not any("llm_enrichment_unavailable" in a for a in f.assumptions)
+        assert not any("llm_formula_unavailable" in a for a in f.assumptions)
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ def test_formula_retry_then_success(sample_course_path: Path) -> None:
     assert "failed schema validation" in provider.calls[1]["prompt"]
     # No safe-fallback marker should be present.
     for f in formulas:
-        assert not any("llm_enrichment_unavailable" in a for a in f.assumptions)
+        assert not any("llm_formula_unavailable" in a for a in f.assumptions)
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +218,7 @@ def test_formula_safe_fallback_on_repeated_failure(sample_course_path: Path) -> 
         assert f.needs_review is True
         assert f.confidence <= 0.4
         assert any(
-            "llm_enrichment_unavailable" in a for a in f.assumptions
+            "llm_formula_unavailable" in a for a in f.assumptions
         ), f"formula {f.id} missing safe-fallback marker; assumptions={f.assumptions}"
         # Source refs MUST survive the fallback.
         assert f.source_refs
@@ -238,7 +238,7 @@ def test_formula_provider_exception_falls_back(sample_course_path: Path) -> None
     for f in formulas:
         assert f.needs_review is True
         assert any(
-            "llm_enrichment_unavailable: llm_call_failed" in a for a in f.assumptions
+            "llm_formula_unavailable: llm_call_failed" in a for a in f.assumptions
         )
 
 
@@ -464,6 +464,45 @@ def test_formula_prompt_does_not_leak_api_key(sample_course_path: Path) -> None:
     for call in provider.calls:
         assert "sk-" not in call["prompt"]
         assert "API_KEY" not in call["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# 13. Full pipeline completes even when formula LLM always fails
+# ---------------------------------------------------------------------------
+
+
+def test_full_pipeline_formula_llm_fails_still_completes(
+    sample_course_path: Path,
+) -> None:
+    """Pipeline must reach status='completed' when FormulaAgent falls back safely."""
+    from stem_learning_agent.core.config import RunConfig
+    from stem_learning_agent.harness.orchestrator import Orchestrator
+
+    cfg = RunConfig(course_path=sample_course_path)
+    orch = Orchestrator(cfg)
+    orch.init()
+
+    # Swap in a non-mock provider that always raises — this triggers FormulaAgent's fallback.
+    orch.ctx.llm = _ScriptedProvider(raise_on_call=RuntimeError("simulated API outage"))
+
+    run = orch.run_full()
+
+    # The pipeline must finish successfully via the fallback path.
+    assert run.status == "completed", f"Expected completed, got {run.status}"
+    # formulas.json must exist with fallback-marked entries.
+    formulas_path = orch.workspace.formulas_path()
+    assert formulas_path.exists(), "formulas.json must be written even on LLM fallback"
+    raw = io_utils.read_json(formulas_path)
+    assert isinstance(raw, list)
+    for entry in raw:
+        assert entry.get("needs_review") is True
+        assert any(
+            "llm_formula_unavailable" in a for a in (entry.get("assumptions") or [])
+        ), f"formula {entry.get('id')} missing fallback marker"
+    # The pipeline must also produce final output files.
+    assert orch.workspace.final_full_notes_path().exists()
+    assert orch.workspace.final_revision_notes_path().exists()
+    assert orch.workspace.final_index_path().exists()
 
 
 if __name__ == "__main__":  # pragma: no cover

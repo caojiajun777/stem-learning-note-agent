@@ -163,6 +163,9 @@ def _safe_fallback(example: ExampleProblem, reason: str) -> ExampleProblem:
     example.confidence = min(example.confidence, 0.4)
     example.needs_review = True
     # We do NOT fabricate concepts or formulas on fallback.
+    marker = f"llm_example_unavailable: {reason}"
+    if marker not in example.assumptions:
+        example.assumptions = example.assumptions + [marker]
     return example
 
 

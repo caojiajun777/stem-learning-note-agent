@@ -8,10 +8,15 @@ Two execution paths:
   heuristic score based on semantic understanding.
 
 The heuristic matcher is always run first; the LLM path is additive.
+
+LLM call budget is capped by STEM_AGENT_LLM_MATCH_MAX_PAIRS (default 8).
+Only the top-K lowest-confidence pairs are sent to the LLM; the rest keep
+their heuristic scores. Set to 0 to skip LLM matching entirely.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import Counter
 from typing import Any, Optional
@@ -54,6 +59,19 @@ _STOPWORDS = {
     "a",
 }
 
+_DEFAULT_MAX_PAIRS = 8
+_REASON_MAX_LEN = 200
+
+
+def _resolve_max_pairs() -> int:
+    raw = os.environ.get("STEM_AGENT_LLM_MATCH_MAX_PAIRS", "").strip()
+    if raw == "":
+        return _DEFAULT_MAX_PAIRS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_MAX_PAIRS
+
 
 def _tokenize(text: str) -> list[str]:
     return [t.lower() for t in _TOKEN_RE.findall(text or "") if t.lower() not in _STOPWORDS]
@@ -94,7 +112,7 @@ class _LLMMatchPatch(BaseModel):
     part_id: str = Field(min_length=1, max_length=64)
     is_relevant: bool = False
     confidence_adjustment: float = Field(default=0.0, ge=-0.5, le=0.5)
-    reason: Optional[str] = Field(default=None, max_length=200)
+    reason: Optional[str] = Field(default=None, max_length=_REASON_MAX_LEN)
 
 
 class _LLMMatchBatchPatch(BaseModel):
@@ -130,12 +148,14 @@ def _build_match_prompt(
         "Return JSON with EXACTLY these keys:\n"
         '  "matches": list of objects with keys\n'
         '      {example_id, part_id, is_relevant (bool),\n'
-        '       confidence_adjustment (float in [-0.5, 0.5]), reason?}.\n'
+        '       confidence_adjustment (float in [-0.5, 0.5]),\n'
+        f'       reason? (string, at most {_REASON_MAX_LEN} characters)}}.\n'
         "Rules:\n"
         "- is_relevant=true if the example directly teaches or reinforces the part's concepts.\n"
         "- confidence_adjustment: positive if the match is stronger than the heuristic suggests, "
         "negative if weaker.\n"
         "- If the example is unrelated or off-topic, set is_relevant=false.\n"
+        "- Keep reason concise (under 200 characters).\n"
     )
     if retry_error is not None:
         header += (
@@ -163,6 +183,21 @@ def _strip_to_json_object(text: str) -> str:
     return t
 
 
+def _truncate_reasons(raw: dict) -> dict:
+    """Truncate reason fields in the raw parsed dict before schema validation.
+
+    Prevents long LLM reasons from triggering max_length=200 ValidationError
+    and wasting a retry call.
+    """
+    matches = raw.get("matches")
+    if not isinstance(matches, list):
+        return raw
+    for m in matches:
+        if isinstance(m, dict) and isinstance(m.get("reason"), str):
+            m["reason"] = m["reason"][:_REASON_MAX_LEN]
+    return raw
+
+
 def _llm_refine_match(
     llm: Any,
     example: ExampleProblem,
@@ -171,7 +206,11 @@ def _llm_refine_match(
     *,
     system_prompt: str,
 ) -> Optional[_LLMMatchPatch]:
-    """Ask the LLM to refine a single match. Returns None on failure."""
+    """Ask the LLM to refine a single match. Returns None on any failure.
+
+    Failures (timeout, schema error) fall back silently to the heuristic
+    result for this pair — they never propagate to other pairs.
+    """
     last_error: Optional[str] = None
     for attempt in range(2):
         user_prompt = _build_match_prompt(
@@ -186,26 +225,28 @@ def _llm_refine_match(
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "match_examples: LLM call failed (attempt %d): %s", attempt, exc
+                "match_examples: LLM call failed for pair (%s, %s) attempt %d: %s: %s",
+                example.id, part.id, attempt, type(exc).__name__, str(exc)[:120],
             )
-            return None
+            return None  # fall back to heuristic for this pair
 
         try:
-            payload = _strip_to_json_object(resp.text)
-            batch = _LLMMatchBatchPatch.model_validate_json(payload)
+            payload_str = _strip_to_json_object(resp.text)
+            raw = json.loads(payload_str)
+            raw = _truncate_reasons(raw)  # truncate before schema validation
+            batch = _LLMMatchBatchPatch.model_validate(raw)
             if batch.matches:
                 return batch.matches[0]
             return None
         except (json.JSONDecodeError, ValidationError) as exc:
-            last_error = str(exc)[:600]
+            last_error = str(exc)[:400]
             log.warning(
-                "match_examples: schema_validation_failed (attempt %d): %s",
-                attempt,
-                last_error,
+                "match_examples: schema_validation_failed for pair (%s, %s) attempt %d: %s",
+                example.id, part.id, attempt, last_error,
             )
             if attempt == 0:
                 continue
-            return None
+            return None  # fall back to heuristic for this pair
     return None
 
 
@@ -225,6 +266,7 @@ class MatchExamplesTool(Tool):
         parts: list[LearningPart],
         threshold: float = 0.05,
         llm: Any = None,
+        max_llm_pairs: Optional[int] = None,
     ) -> ToolResult:  # type: ignore[override]
         """Match examples to parts using heuristic + optional LLM refinement.
 
@@ -233,6 +275,7 @@ class MatchExamplesTool(Tool):
             parts: Learning parts from the curriculum outline.
             threshold: Minimum heuristic score to consider a match.
             llm: Optional LLM provider. If None or name=="mock", uses heuristic only.
+            max_llm_pairs: Override for the LLM call budget. None → read from env.
         """
         matches: list[ExampleMatch] = []
         warnings: list[str] = []
@@ -240,15 +283,26 @@ class MatchExamplesTool(Tool):
         provider_name = getattr(llm, "name", "mock") if llm is not None else "mock"
         use_llm = provider_name != "mock"
 
+        # Resolve LLM call budget.
+        budget = max_llm_pairs if max_llm_pairs is not None else _resolve_max_pairs()
+        if use_llm and budget == 0:
+            use_llm = False
+            warnings.append("match_examples: STEM_AGENT_LLM_MATCH_MAX_PAIRS=0; using heuristic only.")
+            log.info("match_examples: LLM matching disabled (max_pairs=0).")
+
         system_prompt = (
             "You are MatchExamplesTool inside a STEM teaching harness. "
             "You assess whether an example problem is relevant to a learning part. "
             "Hard rules:\n"
             "- is_relevant=true only if the example directly teaches or reinforces the part's concepts.\n"
             "- confidence_adjustment should be in [-0.5, 0.5].\n"
+            f"- Keep reason under {_REASON_MAX_LEN} characters.\n"
             "- Output MUST be valid JSON. No markdown fences. No commentary."
         )
 
+        # First pass: compute heuristic scores for all (example, part) pairs.
+        # Collect candidates above threshold.
+        heuristic_results: list[tuple[ExampleProblem, float, LearningPart, list[str]]] = []
         for ex in examples:
             scored: list[tuple[float, LearningPart, list[str]]] = []
             for p in parts:
@@ -256,47 +310,56 @@ class MatchExamplesTool(Tool):
                 if s > 0:
                     scored.append((s, p, shared))
             scored.sort(key=lambda t: t[0], reverse=True)
-
-            # Keep top 2 candidates above threshold.
             kept = [t for t in scored if t[0] >= threshold][:2]
             if not kept:
                 warnings.append(
                     f"match_examples: no part met threshold for example {ex.id}; flagged needs_review."
                 )
                 continue
-
             for s, p, shared in kept:
-                final_score = s
-                reason = f"keyword overlap: {', '.join(shared[:5]) or '(low)'}"
+                heuristic_results.append((ex, s, p, shared))
 
-                # LLM refinement (optional).
-                if use_llm and s < 0.3:
-                    # Only refine low-confidence matches to save LLM calls.
-                    patch = _llm_refine_match(
-                        llm, ex, p, s, system_prompt=system_prompt
-                    )
-                    if patch is not None and patch.is_relevant:
-                        final_score = max(0.0, min(1.0, s + patch.confidence_adjustment))
-                        if patch.reason:
-                            reason = f"LLM-refined: {patch.reason[:100]}"
-                    elif patch is not None and not patch.is_relevant:
-                        # LLM says this match is not relevant; skip it.
-                        log.info(
-                            "match_examples: LLM rejected match %s → %s (reason: %s)",
-                            ex.id,
-                            p.id,
-                            patch.reason or "n/a",
-                        )
-                        continue
+        # Second pass: select top-K lowest-confidence pairs for LLM refinement.
+        # "Lowest heuristic confidence" = most uncertain = most valuable to refine.
+        llm_candidates: set[tuple[str, str]] = set()
+        if use_llm and budget > 0:
+            # Sort by heuristic score ascending (low confidence first), take top-K.
+            refinement_order = sorted(heuristic_results, key=lambda t: t[1])
+            for ex, s, p, _ in refinement_order[:budget]:
+                if s < 0.3:  # only refine genuinely uncertain pairs
+                    llm_candidates.add((ex.id, p.id))
+            log.info(
+                "match_examples: %d pair(s) eligible for LLM refinement (budget=%d).",
+                len(llm_candidates), budget,
+            )
 
-                matches.append(
-                    ExampleMatch(
-                        example_id=ex.id,
-                        part_id=p.id,
-                        score=final_score,
-                        reason=reason,
-                        shared_concepts=shared,
+        # Third pass: build final matches.
+        for ex, s, p, shared in heuristic_results:
+            final_score = s
+            reason = f"keyword overlap: {', '.join(shared[:5]) or '(low)'}"
+
+            if use_llm and (ex.id, p.id) in llm_candidates:
+                patch = _llm_refine_match(llm, ex, p, s, system_prompt=system_prompt)
+                if patch is not None and patch.is_relevant:
+                    final_score = max(0.0, min(1.0, s + patch.confidence_adjustment))
+                    if patch.reason:
+                        reason = f"LLM-refined: {patch.reason[:100]}"
+                elif patch is not None and not patch.is_relevant:
+                    log.info(
+                        "match_examples: LLM rejected match %s → %s (reason: %s)",
+                        ex.id, p.id, patch.reason or "n/a",
                     )
+                    continue  # skip this pair — LLM says not relevant
+                # patch is None: fall through to heuristic match silently
+
+            matches.append(
+                ExampleMatch(
+                    example_id=ex.id,
+                    part_id=p.id,
+                    score=final_score,
+                    reason=reason,
+                    shared_concepts=shared,
                 )
+            )
 
         return ToolResult(ok=True, data=ExampleMatching(matches=matches), warnings=warnings)

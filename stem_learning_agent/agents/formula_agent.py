@@ -23,6 +23,7 @@ Hard rules enforced on both paths:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field, ValidationError
@@ -105,6 +106,7 @@ class _LLMFormulaBatchPatch(BaseModel):
 
 
 _UNKNOWN_STRINGS = {"", "?", "n/a", "na", "tbd"}
+_SECRETISH_TOKEN_RE = re.compile(r"sk-[A-Za-z0-9_-]{8,}")
 
 
 def _normalise_unknowns(d: dict[str, str]) -> dict[str, str]:
@@ -125,6 +127,15 @@ def _normalise_unknowns(d: dict[str, str]) -> dict[str, str]:
             value = "unknown"
         out[key] = value
     return out
+
+
+def _short_error(exc: Exception, limit: int = 160) -> str:
+    """Return a compact, secret-redacted exception reason for logs/notes."""
+    text = str(exc).replace("\n", " ").strip()
+    text = _SECRETISH_TOKEN_RE.sub("sk-<redacted>", text)
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text or type(exc).__name__
 
 
 def _apply_patch(formula: Formula, patch: _LLMFormulaPatch) -> tuple[Formula, list[str]]:
@@ -204,7 +215,7 @@ def _safe_fallback(formula: Formula, reason: str) -> Formula:
     """
     formula.confidence = min(formula.confidence, 0.4)
     formula.needs_review = True
-    marker = f"llm_enrichment_unavailable: {reason}"
+    marker = f"llm_formula_unavailable: {reason}"
     if marker not in formula.assumptions:
         formula.assumptions = formula.assumptions + [marker]
     return formula
@@ -323,8 +334,12 @@ def _llm_enrich_batch(
                 temperature=0.1,
             )
         except Exception as exc:  # noqa: BLE001 — provider/transport error
+            short = _short_error(exc)
             log.warning(
-                "formula: LLM call failed (attempt %d): %s", attempt, exc
+                "formula: LLM call failed (attempt %d): %s: %s",
+                attempt,
+                type(exc).__name__,
+                short,
             )
             notes.append(f"llm_call_failed: {type(exc).__name__}")
             return None, "llm_call_failed", notes
