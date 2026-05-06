@@ -31,51 +31,168 @@ from ..llm.prompt_loader import load_prompt
 log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Heuristic rules (unchanged for mock-path compatibility)
+# Heuristic rules — keyword → (concept, kind, why)
+#
+# Rules are organised by subject area. Each part's text bag is matched against
+# the keyword sets; only rules whose keywords have at least one hit are
+# included. Per-part cap: 5 prerequisites.
+#
+# Guard: RC/circuit-specific rules only fire when "RC", "low-pass", "filter",
+# "capacitor", or "resistor" keywords also appear in the same part.
 # ---------------------------------------------------------------------------
 
-_RULES: list[tuple[tuple[str, ...], PrerequisiteConcept]] = [
+
+_HEURISTIC_RULES: list[tuple[tuple[str, ...], str, str, str, bool]] = [
+    # (keywords, concept, kind, why, rc_guarded)
+    # ── Circuit / RC (guarded) ──
     (
-        ("capacitor", "capacit", "电容", "RC"),
-        PrerequisiteConcept(
-            concept="Complex impedance of a capacitor (Z_C = 1/(jωC))",
-            kind="must_review",
-            why="The transfer function of RC filters hinges on this.",
-        ),
+        ("capacitor", "capacit", "电容", "resistor", "low-pass", "lowpass"),
+        "Complex impedance of a capacitor (Z_C = 1/(jωC))",
+        "must_review",
+        "The transfer function of RC filters hinges on this.",
+        True,
     ),
     (
-        ("transfer function", "h(j", "h(s", "传递函数"),
-        PrerequisiteConcept(
-            concept="Transfer function H(jω)",
-            kind="must_review",
-            why="Needed to describe the input/output magnitude and phase.",
-        ),
+        ("rc", "low-pass", "lowpass", "bode", "波特", "magnitude response"),
+        "Logarithmic plots and dB scaling",
+        "quick_reminder",
+        "Interpretation of the Bode plot.",
+        True,
     ),
     (
-        ("cutoff", "cut-off", "截止频率", "corner"),
-        PrerequisiteConcept(
-            concept="Decibels and log-frequency intuition",
-            kind="quick_reminder",
-            why="Useful to read cutoff behaviour on Bode plots.",
-        ),
+        ("rc", "low-pass", "lowpass", "sinusoid", "phasor", "相量"),
+        "Phasor representation of sinusoidal signals",
+        "optional_background",
+        "Grounds the frequency-domain treatment.",
+        True,
+    ),
+    # ── Control systems (unguarded — fires when control keywords appear) ──
+    (
+        ("control system", "feedback", "closed loop", "open loop",
+         "transfer function", "root locus", "stability", "controller"),
+        "Basic algebra and complex numbers",
+        "must_review",
+        "Root locus and stability analysis require comfort with complex-plane arithmetic.",
+        False,
     ),
     (
-        ("bode", "波特", "magnitude response"),
-        PrerequisiteConcept(
-            concept="Logarithmic plots and dB scaling",
-            kind="quick_reminder",
-            why="Interpretation of the Bode plot.",
-        ),
+        ("laplace", "s-domain", "s domain", "transfer function", "h(s"),
+        "Laplace transform basics",
+        "must_review",
+        "S-domain controller design uses the Laplace transform to convert differential equations to algebraic ones.",
+        False,
     ),
     (
-        ("sinusoid", "phasor", "相量"),
-        PrerequisiteConcept(
-            concept="Phasor representation of sinusoidal signals",
-            kind="optional_background",
-            why="Grounds the frequency-domain treatment.",
-        ),
+        ("transfer function", "pole", "zero", "characteristic equation",
+         "root locus", "stability"),
+        "Poles, zeros, and stability intuition",
+        "must_review",
+        "Pole-zero analysis is the primary tool for assessing closed-loop stability.",
+        False,
+    ),
+    (
+        ("bode", "frequency response", "phase margin", "gain margin", "nyquist"),
+        "Frequency response basics",
+        "quick_reminder",
+        "Bode and Nyquist plots are the frequency-domain vocabulary for stability margins.",
+        False,
+    ),
+    (
+        ("z-transform", "z transform", "digital control", "discrete",
+         "sampled data", "bilinear"),
+        "Sampling and Z-transform basics",
+        "must_review",
+        "Digital controller design requires the Z-transform as the discrete-time analogue of the Laplace transform.",
+        False,
+    ),
+    (
+        ("pid", "proportional", "integral", "derivative", "compensator"),
+        "PID control fundamentals",
+        "quick_reminder",
+        "PID structures are the most common industrial controller form.",
+        False,
+    ),
+    (
+        ("state space", "state-space", "observability", "controllability"),
+        "State-space representation basics",
+        "optional_background",
+        "State-space methods complement transfer-function approaches for MIMO and modern control.",
+        False,
+    ),
+    (
+        ("transient response", "settling time", "overshoot", "rise time",
+         "damping ratio", "natural frequency", "specification"),
+        "Second-order system transient response",
+        "quick_reminder",
+        "Time-domain specs (overshoot, settling time) map to pole locations in the s-plane.",
+        False,
+    ),
+    (
+        ("steady-state", "steady state", "disturbance", "error constant"),
+        "Steady-state error and system type",
+        "quick_reminder",
+        "Final-value theorem and system type determine steady-state tracking performance.",
+        False,
+    ),
+    # ── General engineering maths (unguarded) ──
+    (
+        ("complex number", "complex plane", "jω", "jω"),
+        "Complex number arithmetic",
+        "quick_reminder",
+        "Many engineering analysis methods use complex numbers.",
+        False,
+    ),
+    (
+        ("differential equation", "diff eq", "ode"),
+        "Ordinary differential equations",
+        "quick_reminder",
+        "Dynamic systems are modeled by differential equations.",
+        False,
+    ),
+    (
+        ("signal", "sampling", "a/d", "d/a", "adc", "dac"),
+        "Signal sampling and reconstruction basics",
+        "must_review",
+        "Digital control requires understanding of sampling, aliasing, and reconstruction.",
+        False,
     ),
 ]
+
+_RC_GUARD_KEYWORDS = {
+    "rc", "low-pass", "lowpass", "filter", "capacitor", "capacit",
+    "resistor", "bode", "波特", "magnitude response",
+}
+
+
+def _part_has_rc_signal(part_bag: str) -> bool:
+    """True if the part's text contains RC/circuit keywords."""
+    return any(kw in part_bag for kw in _RC_GUARD_KEYWORDS)
+
+
+def _collect_heuristic_prereqs(part_bag: str, max_count: int = 5) -> list[PrerequisiteConcept]:
+    """Match keywords in part_bag and return up to max_count prerequisites."""
+    results: list[PrerequisiteConcept] = []
+    seen_concepts: set[str] = set()
+    for keywords, concept, kind, why, rc_guarded in _HEURISTIC_RULES:
+        if rc_guarded and not _part_has_rc_signal(part_bag):
+            continue
+        hit = any(kw.lower() in part_bag for kw in keywords)
+        if not hit:
+            continue
+        if concept in seen_concepts:
+            continue
+        seen_concepts.add(concept)
+        results.append(
+            PrerequisiteConcept(
+                concept=concept,
+                kind=kind,  # type: ignore[arg-type]
+                why=why,
+            )
+        )
+        if len(results) >= max_count:
+            break
+    return results
+
 
 # ---------------------------------------------------------------------------
 # LLM output schemas
@@ -354,23 +471,17 @@ class PrerequisiteAgent(Agent):
         # ── Heuristic baseline ──
         graph: dict[str, list[PrerequisiteConcept]] = {}
         for p in outline.parts:
-            bag = text_by_part[p.id] + " " + raw_text
-            seen: list[PrerequisiteConcept] = []
-            seen_concepts: set[str] = set()
-            for keywords, prereq in _RULES:
-                if any(k.lower() in bag for k in keywords):
-                    if prereq.concept in seen_concepts:
-                        continue
-                    # Heuristic baseline: default confidence, needs_review.
-                    prereq.confidence = 0.55
-                    prereq.needs_review = True
-                    prereq.source_refs = list(p.source_refs) if p.source_refs else []
-                    seen.append(prereq)
-                    seen_concepts.add(prereq.concept)
-            graph[p.id] = seen
+            bag = text_by_part[p.id]
+            selected = _collect_heuristic_prereqs(bag)
+            for prereq in selected:
+                prereq.confidence = 0.60 if p.source_refs else 0.45
+                prereq.needs_review = True
+                prereq.source_refs = list(p.source_refs) if p.source_refs else []
+            graph[p.id] = selected
 
         aggregate_notes: list[str] = [
-            "MVP heuristic: rules are keyword-based. Extend with LLM reasoning in DeepSeek task 06.",
+            "Heuristic baseline: subject-aware keyword mapping (RC/circuit, control systems, general engineering). "
+            "All items marked needs_review=True. Extend with LLM reasoning for deeper coverage.",
         ]
 
         if use_llm:
