@@ -506,6 +506,14 @@ class ReviewerAgent(Agent):
             if not report.pass_status:
                 any_high = True
 
+        # ── Course-level unit-consistency check (Task 03b) ──
+        from ..tools.check_formula_units import check_formula_units
+
+        unit_findings = check_formula_units(formulas)
+        all_findings.extend(unit_findings)
+        if any(f.severity == "high" for f in unit_findings):
+            any_high = True
+
         # A safe fallback from the LLM path means: we could not do the LLM
         # audit this run. The pipeline must not silently mark the review
         # as passing just because mechanical checks were clean.
