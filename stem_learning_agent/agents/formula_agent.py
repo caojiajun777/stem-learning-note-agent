@@ -19,10 +19,17 @@ Hard rules enforced on both paths:
 - A formula explicitly tagged `background: true` by the LLM is flagged as
   supplemental (not course-original) in `related_concepts`, and its
   confidence is capped at 0.6.
+
+Batching:
+- Large candidate lists are split into sub-batches of at most
+  STEM_AGENT_FORMULA_LLM_BATCH_SIZE (default 8) formulas each.
+- Each sub-batch is enriched independently; a failure in one batch only
+  triggers safe-fallback for that batch's formulas, not the whole list.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Optional
 
@@ -36,6 +43,18 @@ from ..harness.context_manager import ContextLoader
 from ..llm.prompt_loader import load_prompt
 
 log = get_logger(__name__)
+
+_DEFAULT_FORMULA_BATCH_SIZE = 8
+
+
+def _resolve_formula_batch_size() -> int:
+    raw = os.environ.get("STEM_AGENT_FORMULA_LLM_BATCH_SIZE", "").strip()
+    if raw == "":
+        return _DEFAULT_FORMULA_BATCH_SIZE
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_FORMULA_BATCH_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -442,36 +461,46 @@ class FormulaAgent(Agent):
             return
 
         prompt_template = load_prompt("formula_agent")
-        patch, reason, notes = _llm_enrich_batch(
-            ctx, formulas, prompt_template=prompt_template
+        batch_size = _resolve_formula_batch_size()
+        batches = [formulas[i : i + batch_size] for i in range(0, len(formulas), batch_size)]
+        log.info(
+            "FormulaAgent: %d formula(s) split into %d batch(es) of ≤%d (provider=%s).",
+            len(formulas), len(batches), batch_size, provider_name,
         )
-        unresolved_log.extend(notes)
 
-        if patch is None:
-            # Safe fallback: the LLM branch failed. We apply conservative
-            # defaults to every candidate and keep the heuristic glossary
-            # hits as a minimum floor, but we never pretend the LLM succeeded.
-            kept = [
-                _safe_fallback(_enrich_heuristic(f), reason=reason) for f in formulas
-            ]
-            unresolved_log.append(
-                f"formula_agent safe-fallback applied to all {len(kept)} candidate(s): {reason}"
+        all_kept: list[Formula] = []
+        for batch_idx, batch in enumerate(batches):
+            patch, reason, notes = _llm_enrich_batch(
+                ctx, batch, prompt_template=prompt_template
             )
-            log.warning(
-                "FormulaAgent: safe-fallback (reason=%s) over %d candidate(s).",
-                reason,
-                len(kept),
-            )
-        else:
-            kept, issues, _patched_ids = _apply_batch(formulas, patch)
-            unresolved_log.extend(issues)
-            log.info(
-                "FormulaAgent: %d enriched, %d dropped, %d notes (provider=%s).",
-                len(kept),
-                len(formulas) - len(kept),
-                len(unresolved_log),
-                provider_name,
-            )
+            unresolved_log.extend(notes)
+
+            if patch is None:
+                kept_batch = [
+                    _safe_fallback(_enrich_heuristic(f), reason=reason) for f in batch
+                ]
+                unresolved_log.append(
+                    f"formula_agent safe-fallback applied to batch {batch_idx} "
+                    f"({len(kept_batch)} candidate(s)): {reason}"
+                )
+                log.warning(
+                    "FormulaAgent: safe-fallback batch %d (reason=%s) over %d candidate(s).",
+                    batch_idx, reason, len(kept_batch),
+                )
+            else:
+                kept_batch, issues, _patched_ids = _apply_batch(batch, patch)
+                unresolved_log.extend(issues)
+                log.info(
+                    "FormulaAgent: batch %d — %d enriched, %d dropped.",
+                    batch_idx, len(kept_batch), len(batch) - len(kept_batch),
+                )
+            all_kept.extend(kept_batch)
+
+        kept = all_kept
+        log.info(
+            "FormulaAgent: %d total kept, %d notes (provider=%s).",
+            len(kept), len(unresolved_log), provider_name,
+        )
 
         io_utils.write_json(
             ctx.workspace.formulas_path(),

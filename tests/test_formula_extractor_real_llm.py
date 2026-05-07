@@ -505,5 +505,183 @@ def test_full_pipeline_formula_llm_fails_still_completes(
     assert orch.workspace.final_index_path().exists()
 
 
+# ---------------------------------------------------------------------------
+# Helpers for batching tests — inject synthetic formulas
+# ---------------------------------------------------------------------------
+
+
+def _make_synthetic_formulas(n: int) -> list[Formula]:
+    from stem_learning_agent.core.schemas import SourceRef
+    return [
+        Formula(
+            id=f"f{i:03d}",
+            latex=f"x_{i} = {i}",
+            plain_text=f"x_{i} = {i}",
+            source_refs=[SourceRef(material_id="m", chunk_id=f"c{i}")],
+            confidence=0.5,
+            needs_review=True,
+        )
+        for i in range(n)
+    ]
+
+
+def _patch_extract_formulas(monkeypatch: pytest.MonkeyPatch, formulas: list[Formula]) -> None:
+    from stem_learning_agent.harness.tool_base import ToolResult
+    from stem_learning_agent.tools.extract_formulas import ExtractFormulasTool
+
+    def _fake_run(self, *, chunks):  # type: ignore[no-untyped-def]
+        return ToolResult(ok=True, data=formulas)
+
+    monkeypatch.setattr(ExtractFormulasTool, "run", _fake_run)
+
+
+def _valid_patch_for_ids(ids: list[str]) -> str:
+    formulas = [
+        {
+            "id": fid,
+            "latex": None,
+            "plain_text": None,
+            "variables": {"x": "a variable"},
+            "units": {"x": "unknown"},
+            "assumptions": ["synthetic"],
+            "usage_conditions": ["test only"],
+            "related_concepts": ["test"],
+            "background": False,
+            "drop": False,
+            "notes": None,
+        }
+        for fid in ids
+    ]
+    return json.dumps({"formulas": formulas})
+
+
+def _ids_from_prompt(prompt: str) -> list[str]:
+    """Extract formula candidate IDs from the JSON payload embedded in the prompt."""
+    marker = "---\n"
+    idx = prompt.rfind(marker)
+    if idx == -1:
+        return []
+    try:
+        data = json.loads(prompt[idx + len(marker):])
+        return [c["id"] for c in data.get("formula_candidates", [])]
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+
+# ---------------------------------------------------------------------------
+# 14. FormulaAgent splits large candidate list into sub-batches
+# ---------------------------------------------------------------------------
+
+
+def test_formula_agent_batches_large_candidate_list(
+    sample_course_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """10 formulas with batch_size=4 → 3 LLM calls (batches of 4, 4, 2)."""
+    monkeypatch.setenv("STEM_AGENT_FORMULA_LLM_BATCH_SIZE", "4")
+    orch = _orchestrator_ready_for_formula(sample_course_path)
+    synthetic = _make_synthetic_formulas(10)
+    _patch_extract_formulas(monkeypatch, synthetic)
+
+    def responder(prompt: str, call_idx: int) -> str:
+        ids = _ids_from_prompt(prompt)
+        return _valid_patch_for_ids(ids)
+
+    provider = _ScriptedProvider(responder=responder)
+    orch.ctx.llm = provider
+
+    formulas = _run_formula_agent(orch)
+    assert len(provider.calls) == 3, (
+        f"expected 3 batch calls (4+4+2), got {len(provider.calls)}"
+    )
+    assert len(formulas) == 10, f"all 10 formulas must be in output, got {len(formulas)}"
+    for f in formulas:
+        assert not any("llm_formula_unavailable" in a for a in f.assumptions), (
+            f"formula {f.id} should be enriched, not fallen back"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 15. One failed batch falls back; other batches succeed
+# ---------------------------------------------------------------------------
+
+
+def test_formula_agent_partial_batch_failure(
+    sample_course_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """8 formulas, batch_size=4: batch 0 always returns garbage → fallback;
+    batch 1 returns valid patch → enriched. All 8 formulas in output."""
+    monkeypatch.setenv("STEM_AGENT_FORMULA_LLM_BATCH_SIZE", "4")
+    orch = _orchestrator_ready_for_formula(sample_course_path)
+    synthetic = _make_synthetic_formulas(8)
+    _patch_extract_formulas(monkeypatch, synthetic)
+
+    batch0_ids = {f.id for f in synthetic[:4]}  # f000–f003
+    batch1_ids = {f.id for f in synthetic[4:]}  # f004–f007
+
+    def responder(prompt: str, call_idx: int) -> str:
+        ids = _ids_from_prompt(prompt)
+        # Batch 0 gets 2 attempts (attempt 0 and retry), both garbage.
+        # Batch 1 gets 1 attempt, valid.
+        if set(ids) == batch0_ids:
+            return "not valid json at all"
+        return _valid_patch_for_ids(ids)
+
+    provider = _ScriptedProvider(responder=responder)
+    orch.ctx.llm = provider
+
+    formulas = _run_formula_agent(orch)
+
+    # Batch 0: 2 attempts (original + retry), batch 1: 1 attempt → 3 total.
+    assert len(provider.calls) == 3, (
+        f"expected 3 calls (2 for failed batch + 1 for success), got {len(provider.calls)}"
+    )
+    assert len(formulas) == 8, f"all 8 formulas must be present, got {len(formulas)}"
+
+    for f in formulas:
+        if f.id in batch0_ids:
+            assert any("llm_formula_unavailable" in a for a in f.assumptions), (
+                f"batch-0 formula {f.id} should have fallback marker"
+            )
+        else:
+            assert not any("llm_formula_unavailable" in a for a in f.assumptions), (
+                f"batch-1 formula {f.id} should be enriched, not fallen back"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 16. formulas.json contains all formulas after mixed success/fallback
+# ---------------------------------------------------------------------------
+
+
+def test_formula_agent_formulas_json_complete_after_mixed_batches(
+    sample_course_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """formulas.json must contain every input formula regardless of batch outcome."""
+    monkeypatch.setenv("STEM_AGENT_FORMULA_LLM_BATCH_SIZE", "3")
+    orch = _orchestrator_ready_for_formula(sample_course_path)
+    synthetic = _make_synthetic_formulas(6)
+    _patch_extract_formulas(monkeypatch, synthetic)
+
+    call_count = {"n": 0}
+
+    def responder(prompt: str, call_idx: int) -> str:
+        call_count["n"] += 1
+        ids = _ids_from_prompt(prompt)
+        # First batch always fails both attempts.
+        if call_count["n"] <= 2:
+            return "garbage"
+        return _valid_patch_for_ids(ids)
+
+    provider = _ScriptedProvider(responder=responder)
+    orch.ctx.llm = provider
+
+    _run_formula_agent(orch)
+
+    raw = io_utils.read_json(orch.workspace.formulas_path())
+    assert len(raw) == 6, f"formulas.json must have 6 entries, got {len(raw)}"
+    ids_in_file = {e["id"] for e in raw}
+    assert ids_in_file == {f.id for f in synthetic}
+
+
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-q"])

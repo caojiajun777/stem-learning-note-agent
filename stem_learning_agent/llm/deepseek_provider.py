@@ -10,6 +10,10 @@ defaults:
     DEEPSEEK_THINKING_INTENSITY          max
     DEEPSEEK_THINKING_BUDGET             4096
     DEEPSEEK_DISABLE_THINKING_FOR_JSON   true (omit thinking when response_format=json_object)
+    DEEPSEEK_MAX_TOKENS                  4096  (free-form generation default)
+    DEEPSEEK_JSON_MAX_TOKENS             4096  (structured JSON calls; overrides DEEPSEEK_MAX_TOKENS
+                                               when response_format=json_object and caller did not
+                                               pass an explicit max_tokens)
     DEEPSEEK_API_KEY                     (required; no default)
 
 The thinking-intensity payload shape is centralised in
@@ -52,6 +56,7 @@ DEFAULT_THINKING_BUDGET = 4096
 DEFAULT_DISABLE_THINKING_FOR_JSON = True
 DEFAULT_TIMEOUT_SECONDS = 60
 DEFAULT_MAX_TOKENS = 4096
+DEFAULT_JSON_MAX_TOKENS = 4096
 DEFAULT_TEMPERATURE = 0.3
 
 
@@ -67,6 +72,7 @@ class DeepSeekConfig:
     disable_thinking_for_json: bool = DEFAULT_DISABLE_THINKING_FOR_JSON
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     max_tokens: int = DEFAULT_MAX_TOKENS
+    json_max_tokens: int = DEFAULT_JSON_MAX_TOKENS
     temperature: float = DEFAULT_TEMPERATURE
 
     @classmethod
@@ -93,6 +99,7 @@ class DeepSeekConfig:
             ),
             timeout_seconds=_int_env(e, "DEEPSEEK_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS),
             max_tokens=_int_env(e, "DEEPSEEK_MAX_TOKENS", DEFAULT_MAX_TOKENS),
+            json_max_tokens=_int_env(e, "DEEPSEEK_JSON_MAX_TOKENS", DEFAULT_JSON_MAX_TOKENS),
             temperature=_float_env(e, "DEEPSEEK_TEMPERATURE", DEFAULT_TEMPERATURE),
         )
 
@@ -180,17 +187,32 @@ def build_payload(
     Accepts either a bare ``prompt`` string or a pre-built ``messages`` list.
     Adds the centralised thinking-intensity payload. Never includes the API
     key (that travels in the Authorization header).
+
+    Token budget selection (in priority order):
+    1. Explicit ``max_tokens`` kwarg from the caller.
+    2. ``config.json_max_tokens`` when ``response_format=json_object`` (avoids
+       finish=length on large structured JSON outputs).
+    3. ``config.max_tokens`` for free-form generation.
     """
     if messages is None:
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt or ""})
+
+    # Resolve effective token limit.
+    if max_tokens is not None:
+        effective_max_tokens = max_tokens
+    elif _is_json_object_response_format(response_format):
+        effective_max_tokens = config.json_max_tokens
+    else:
+        effective_max_tokens = config.max_tokens
+
     body: dict[str, Any] = {
         "model": config.model,
         "messages": messages,
         "temperature": config.temperature if temperature is None else temperature,
-        "max_tokens": config.max_tokens if max_tokens is None else max_tokens,
+        "max_tokens": effective_max_tokens,
         "stream": False,
     }
     if response_format is not None:

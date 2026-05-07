@@ -20,6 +20,7 @@ from stem_learning_agent.core.errors import (
 )
 from stem_learning_agent.llm.deepseek_provider import (
     DEFAULT_BASE_URL,
+    DEFAULT_JSON_MAX_TOKENS,
     DEFAULT_MODEL,
     DEFAULT_THINKING_BUDGET,
     DEFAULT_THINKING_INTENSITY,
@@ -66,6 +67,7 @@ def test_config_from_env_honours_overrides(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("DEEPSEEK_DISABLE_THINKING_FOR_JSON", "0")
     monkeypatch.setenv("DEEPSEEK_TIMEOUT_SECONDS", "30")
     monkeypatch.setenv("DEEPSEEK_MAX_TOKENS", "256")
+    monkeypatch.setenv("DEEPSEEK_JSON_MAX_TOKENS", "2048")
     monkeypatch.setenv("DEEPSEEK_TEMPERATURE", "0.1")
     cfg = DeepSeekConfig.from_env()
     assert cfg.base_url == "https://example.test"  # trailing slash stripped
@@ -75,6 +77,7 @@ def test_config_from_env_honours_overrides(monkeypatch: pytest.MonkeyPatch) -> N
     assert cfg.disable_thinking_for_json is False
     assert cfg.timeout_seconds == 30
     assert cfg.max_tokens == 256
+    assert cfg.json_max_tokens == 2048
     assert cfg.temperature == pytest.approx(0.1)
 
 
@@ -241,6 +244,65 @@ def test_provider_maps_socket_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(urllib.request, "urlopen", fake_open)
     with pytest.raises(LLMTimeoutError):
         provider.generate("hi", timeout=1)
+
+
+# ---------------------------------------------------------------------------
+# JSON max_tokens policy
+# ---------------------------------------------------------------------------
+
+
+def test_payload_json_response_format_uses_json_max_tokens() -> None:
+    """When response_format=json_object and no explicit max_tokens, use json_max_tokens."""
+    cfg = _cfg()
+    cfg.max_tokens = 512
+    cfg.json_max_tokens = 3000
+    payload = build_payload(cfg, prompt="return json", response_format={"type": "json_object"})
+    assert payload["max_tokens"] == 3000
+
+
+def test_payload_free_form_uses_max_tokens_not_json_max_tokens() -> None:
+    """Free-form calls (no response_format) must use max_tokens, not json_max_tokens."""
+    cfg = _cfg()
+    cfg.max_tokens = 512
+    cfg.json_max_tokens = 3000
+    payload = build_payload(cfg, prompt="teach me")
+    assert payload["max_tokens"] == 512
+
+
+def test_payload_explicit_max_tokens_overrides_json_default() -> None:
+    """An explicit max_tokens kwarg always wins over both config fields."""
+    cfg = _cfg()
+    cfg.max_tokens = 512
+    cfg.json_max_tokens = 3000
+    payload = build_payload(
+        cfg,
+        prompt="return json",
+        response_format={"type": "json_object"},
+        max_tokens=128,
+    )
+    assert payload["max_tokens"] == 128
+
+
+def test_payload_explicit_max_tokens_overrides_free_form_default() -> None:
+    """Explicit max_tokens also overrides the free-form default."""
+    cfg = _cfg()
+    cfg.max_tokens = 512
+    payload = build_payload(cfg, prompt="teach me", max_tokens=64)
+    assert payload["max_tokens"] == 64
+
+
+def test_config_json_max_tokens_default() -> None:
+    """json_max_tokens defaults to DEFAULT_JSON_MAX_TOKENS when env var is absent."""
+    cfg = DeepSeekConfig(api_key="sk-test-1234567890")
+    assert cfg.json_max_tokens == DEFAULT_JSON_MAX_TOKENS
+
+
+def test_config_from_env_json_max_tokens_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DEEPSEEK_JSON_MAX_TOKENS absent → falls back to DEFAULT_JSON_MAX_TOKENS."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-1234567890")
+    monkeypatch.delenv("DEEPSEEK_JSON_MAX_TOKENS", raising=False)
+    cfg = DeepSeekConfig.from_env()
+    assert cfg.json_max_tokens == DEFAULT_JSON_MAX_TOKENS
 
 
 # ---------------------------------------------------------------------------
