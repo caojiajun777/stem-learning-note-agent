@@ -66,6 +66,10 @@ VisualKind = Literal[
     "static_frames",
     "table",
     "mermaid_candidate",
+    "pole_zero_plot",
+    "step_response",
+    "root_locus_plot",
+    "z_plane_mapping",
 ]
 
 

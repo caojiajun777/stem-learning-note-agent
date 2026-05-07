@@ -299,3 +299,29 @@ def test_title_quality_functions_are_pure() -> None:
         assert "urllib" not in src, f"{fn.__name__} should not make HTTP calls"
         assert "requests" not in src, f"{fn.__name__} should not use requests"
         assert "generate(" not in src, f"{fn.__name__} should not call LLM generate"
+
+
+# ---------------------------------------------------------------------------
+# 8. Additional _core_question_from_title rules (Task B)
+# ---------------------------------------------------------------------------
+
+
+def test_core_question_s_z_mapping() -> None:
+    q = _core_question_from_title("chapter11 s zmapping and digital poles")
+    assert "z" in q.lower() or "s-to-z" in q.lower() or "mapping" in q.lower()
+    assert "?" in q
+    assert "What does" not in q
+
+
+def test_core_question_closed_loop_spec() -> None:
+    q = _core_question_from_title("EEEE3066 closed loop spec and performance")
+    assert "transient" in q.lower() or "settling" in q.lower() or "damping" in q.lower()
+    assert "?" in q
+    assert "What does" not in q
+
+
+def test_core_question_overshoot_settling_time() -> None:
+    q = _core_question_from_title("Overshoot Settling Time and Rise Time")
+    assert "transient" in q.lower() or "settling" in q.lower()
+    assert "?" in q
+    assert "What does" not in q

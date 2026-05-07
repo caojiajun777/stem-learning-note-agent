@@ -194,6 +194,20 @@ _CORE_QUESTION_RULES: list[tuple[re.Pattern[str], str]] = [
         "How are continuous-time control techniques adapted for discrete-time digital implementation?",
     ),
     (
+        re.compile(r"s[\-\s]?z\s*map|z[\-\s]?s\s*map|s\s*to\s*z|s[\-\s]z\s*transform", re.IGNORECASE),
+        "How does s-to-z mapping relate continuous-time poles and responses to discrete-time system behaviour?",
+    ),
+    (
+        re.compile(
+            r"closed[\-\s]loop\s*(spec|performance|response)|"
+            r"overshoot|settling\s*time|rise\s*time|"
+            r"transient\s*(response|spec|performance)|"
+            r"steady[\-\s]state\s*(error|spec)",
+            re.IGNORECASE,
+        ),
+        "How do transient-response specifications quantify the speed and damping of a control system?",
+    ),
+    (
         re.compile(r"control\s*system|feedback|closed\s*loop|open\s*loop", re.IGNORECASE),
         "What are the basic ideas and design goals of feedback control systems?",
     ),

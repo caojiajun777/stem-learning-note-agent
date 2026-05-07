@@ -29,11 +29,11 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 _VISUAL_RULES: list[tuple[tuple[str, ...], str, str, str, str]] = [
-    # ── circuit_diagram ──
+    # ── circuit_diagram (RC / circuit-specific only) ──
     (
-        ("rc circuit", "resistor", "capacitor", "low-pass filter",
-         "lowpass filter", "high-pass filter", "高通", "低通滤波器",
-         "circuit", "schematic", "circuit diagram", "rc low"),
+        ("rc circuit", "rc low", "rc filter", "resistor", "capacitor",
+         "low-pass filter", "lowpass filter", "high-pass filter",
+         "高通", "低通滤波器", "circuit schematic", "circuit diagram"),
         "circuit_state_diagram",
         "RC Low-Pass Filter Circuit Diagram",
         "Schematic of the RC low-pass filter: input voltage source, series resistor R, "
@@ -41,37 +41,88 @@ _VISUAL_RULES: list[tuple[tuple[str, ...], str, str, str, str]] = [
         "A circuit diagram anchors the physical interpretation of the transfer function "
         "and makes component roles visible before algebraic manipulation.",
     ),
+    # ── root_locus_plot ──
+    (
+        ("root locus", "pole movement", "closed-loop pole", "closed loop pole"),
+        "root_locus_plot",
+        "Root Locus Plot",
+        "Root locus diagram showing closed-loop pole trajectories as gain K varies: "
+        "open-loop poles marked with ×, zeros with ○, loci coloured by gain value, "
+        "and stability boundary on the imaginary axis.",
+        "The root locus is the canonical visual for understanding how feedback gain "
+        "shifts closed-loop poles and affects stability and transient response.",
+    ),
     # ── bode_plot / waveform ──
     (
         ("bode", "frequency response", "magnitude plot", "phase plot",
-         "cutoff frequency", "gain", "magnitude response",
-         "频率响应", "截止频率", "幅频", "相频"),
+         "cutoff frequency", "gain margin", "phase margin",
+         "magnitude response", "频率响应", "截止频率", "幅频", "相频"),
         "waveform",
         "Bode Plot (Magnitude and Phase)",
-        "Log-log magnitude plot showing flat passband below f_c, -20 dB/decade "
-        "roll-off above f_c, and a smooth phase transition from 0 to -90 centred at f_c.",
-        "The Bode plot is the standard visual vocabulary for describing filter "
-        "behaviour; students need to connect the algebraic H(jw) to the shape of the curves.",
+        "Log-log magnitude plot showing system gain vs frequency, and corresponding "
+        "phase plot, with gain margin and phase margin annotated at the crossover frequencies.",
+        "The Bode plot is the standard visual vocabulary for describing frequency-domain "
+        "behaviour and stability margins in control system design.",
     ),
-    # ── derivation_flow ──
+    # ── step_response (transient performance) ──
     (
-        ("transfer function", "derive", "derivation", "推导",
-         "voltage divider", "h(j", "h(s)"),
+        ("step response", "overshoot", "settling time", "rise time",
+         "transient response", "percent overshoot", "transient spec",
+         "closed-loop spec", "closed loop spec", "steady-state error",
+         "steady state error"),
+        "step_response",
+        "Step Response Plot",
+        "Step response curve annotated with: rise time t_r, peak time t_p, "
+        "percent overshoot %OS, settling time t_s, and steady-state value y_ss, "
+        "compared against the specification envelope.",
+        "The step response directly visualises transient-performance specifications; "
+        "seeing where the curve violates spec boundaries motivates controller redesign.",
+    ),
+    # ── z_plane_mapping ──
+    (
+        ("z-transform", "z transform", "z plane", "s-to-z", "s to z",
+         "s-z map", "s z mapping", "zmapping", "z mapping",
+         "digital poles", "discrete pole"),
+        "z_plane_mapping",
+        "s-to-z Pole Mapping",
+        "Side-by-side s-plane (left) and z-plane (right) diagrams showing how "
+        "continuous-time poles map under z = e^(sT): stability boundary from "
+        "left-half s-plane to unit circle in z-plane, with example pole pairs annotated.",
+        "The s-to-z mapping diagram is essential for understanding why discrete-time "
+        "stability is defined by the unit circle and how analogue designs translate to digital.",
+    ),
+    # ── derivation_flow (generic — no RC-specific content) ──
+    (
+        ("derive", "derivation", "推导", "h(j", "h(s)", "voltage divider"),
         "derivation_flow",
-        "Transfer Function Derivation Steps",
-        "Step-by-step boxes: (1) redraw as voltage divider, (2) substitute Z_C = 1/(jwC), "
-        "(3) simplify fraction, (4) normalise to 1/(1 + jwRC), (5) identify cutoff condition wRC = 1.",
-        "A sequenced derivation flow helps students see the algebraic path from circuit "
-        "topology to frequency-domain transfer function without getting lost in symbols.",
+        "Step-by-Step Derivation",
+        "Numbered derivation boxes: each step shows one algebraic transformation, "
+        "with the key substitution or simplification labelled, leading from the "
+        "starting equation to the final closed-form result.",
+        "A sequenced derivation flow helps students follow the algebraic path without "
+        "losing track of which substitution produced each line.",
+    ),
+    # ── block_diagram (feedback / control systems) ──
+    (
+        ("block diagram", "signal flow", "feedback loop", "closed loop",
+         "open loop", "pid", "controller", "plant", "actuator", "sensor",
+         "黑盒子", "black box", "input output"),
+        "block_diagram",
+        "Feedback Control Block Diagram",
+        "Standard feedback block diagram: reference r(t) → summing junction → "
+        "controller C(s) → plant G(s) → output y(t), with feedback path H(s) "
+        "back to the summing junction and disturbance d(t) entering at the plant.",
+        "A feedback block diagram makes the closed-loop signal-flow structure explicit "
+        "and is essential for deriving the closed-loop transfer function.",
     ),
     # ── concept_map ──
     (
         ("concept", "overview", "introduction", "概述",
-         "relationship", "depends on", "compare", "区别", "联系"),
+         "relationship", "depends on", "区别", "联系"),
         "concept_map",
         "Concept Map",
-        "Nodes linking: resistor, capacitor, impedance, transfer function, "
-        "cutoff frequency, time constant, Bode plot, filter, passband, stopband.",
+        "Nodes linking the key terms introduced in this part, with labelled edges "
+        "showing dependencies, definitions, and mathematical relationships.",
         "When a part introduces multiple interconnected terms, a concept map reduces "
         "cognitive load by showing structure before diving into equations.",
     ),
@@ -82,21 +133,9 @@ _VISUAL_RULES: list[tuple[tuple[str, ...], str, str, str, str]] = [
         "static_frames",
         "Static Frame Sequence",
         "2-4 labelled frames showing a key dynamic process step by step "
-        "(e.g. capacitor charging, filter response evolution, signal before/after filtering).",
+        "(e.g. system state evolution, signal before/after processing).",
         "Some engineering concepts involve a time evolution or state change that is "
-        "best understood as a sequence of discrete frames rather than a single diagram. "
-        "Later this placeholder can become a short animation.",
-    ),
-    # ── block_diagram ──
-    (
-        ("block diagram", "system", "黑盒子", "black box",
-         "input output", "signal flow"),
-        "block_diagram",
-        "Block Diagram",
-        "High-level block diagram: input signal -> [RC Filter] -> output signal, "
-        "with arrows for signal flow and a frequency-response annotation.",
-        "A block diagram abstracts away component-level detail to show function-level "
-        "signal flow, making it easier to reason about the filter as a system element.",
+        "best understood as a sequence of discrete frames rather than a single diagram.",
     ),
     # ── table ──
     (
@@ -104,8 +143,8 @@ _VISUAL_RULES: list[tuple[tuple[str, ...], str, str, str, str]] = [
          "frequency", "低频", "高频", "low frequency", "high frequency"),
         "table",
         "Comparison Table",
-        "Table comparing: low-frequency behaviour (|H|≈1, phase≈0), cutoff behaviour "
-        "(|H|≈0.707, phase≈-45), and high-frequency behaviour (|H|→0, phase→-90).",
+        "Table comparing system behaviour across key operating regimes or conditions, "
+        "with columns for the relevant metrics (e.g. gain, phase, stability margin).",
         "A side-by-side table makes behavioural regimes explicit and is easy to "
         "reference during problem-solving.",
     ),

@@ -17,10 +17,17 @@ Hard rules enforced on both paths:
 - Academic integrity risk (graded assignment / exam) → do NOT generate
   complete submittable answers; flag `needs_review=True` and write a warning.
 - Unknown difficulty / concepts stay as empty lists; we never fabricate.
+
+Batching:
+- Large candidate lists are split into sub-batches of at most
+  STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE (default 8) examples each.
+- Each sub-batch is enriched independently; a failure in one batch only
+  triggers safe-fallback for that batch's examples.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Optional
 
@@ -41,6 +48,18 @@ _SOLUTION_MARKERS = re.compile(r"(?i)(solution|answer|解|答)")
 _GRADED_MARKERS = re.compile(
     r"(?i)(assignment|homework|coursework|graded|exam|quiz|test|submission|due date)"
 )
+
+_DEFAULT_EXAMPLE_BATCH_SIZE = 8
+
+
+def _resolve_example_batch_size() -> int:
+    raw = os.environ.get("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", "").strip()
+    if raw == "":
+        return _DEFAULT_EXAMPLE_BATCH_SIZE
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_EXAMPLE_BATCH_SIZE
 
 
 # ---------------------------------------------------------------------------
@@ -367,39 +386,53 @@ class ExtractExamplesTool(Tool):
             # Mock / heuristic path (unchanged).
             return ToolResult(ok=True, data=candidates, warnings=warnings)
 
-        # Non-mock path: LLM enrichment with retry + safe fallback.
+        # Non-mock path: LLM enrichment with sub-batching, retry + safe fallback.
         from ..llm.prompt_loader import load_prompt
 
         prompt_template = load_prompt("example_tutor")
-        patch, reason, notes = _llm_enrich_batch(
-            llm, candidates, prompt_template=prompt_template
+        batch_size = _resolve_example_batch_size()
+        batches = [
+            candidates[i : i + batch_size]
+            for i in range(0, len(candidates), batch_size)
+        ]
+        log.info(
+            "ExtractExamplesTool: %d candidate(s) split into %d batch(es) of ≤%d "
+            "(provider=%s).",
+            len(candidates), len(batches), batch_size, provider_name,
         )
 
+        all_kept: list[ExampleProblem] = []
         unresolved_log: list[str] = []
-        unresolved_log.extend(notes)
 
-        if patch is None:
-            # Safe fallback: the LLM branch failed. We apply conservative
-            # defaults to every candidate and keep the heuristic baseline.
-            kept = [_safe_fallback(e, reason=reason) for e in candidates]
-            unresolved_log.append(
-                f"extract_examples safe-fallback applied to all {len(kept)} candidate(s): {reason}"
+        for batch_idx, batch in enumerate(batches):
+            patch, reason, notes = _llm_enrich_batch(
+                llm, batch, prompt_template=prompt_template
             )
-            log.warning(
-                "ExtractExamplesTool: safe-fallback (reason=%s) over %d candidate(s).",
-                reason,
-                len(kept),
-            )
-        else:
-            kept, issues = _apply_batch(candidates, patch)
-            unresolved_log.extend(issues)
-            log.info(
-                "ExtractExamplesTool: %d enriched, %d notes (provider=%s).",
-                len(kept),
-                len(unresolved_log),
-                provider_name,
-            )
+            unresolved_log.extend(notes)
 
-        # Propagate unresolved issues as warnings so they surface in parse_warnings.md.
+            if patch is None:
+                kept_batch = [_safe_fallback(e, reason=reason) for e in batch]
+                unresolved_log.append(
+                    f"extract_examples safe-fallback applied to batch {batch_idx} "
+                    f"({len(kept_batch)} candidate(s)): {reason}"
+                )
+                log.warning(
+                    "ExtractExamplesTool: safe-fallback batch %d (reason=%s) over %d candidate(s).",
+                    batch_idx, reason, len(kept_batch),
+                )
+            else:
+                kept_batch, issues = _apply_batch(batch, patch)
+                unresolved_log.extend(issues)
+                log.info(
+                    "ExtractExamplesTool: batch %d — %d enriched (provider=%s).",
+                    batch_idx, len(kept_batch), provider_name,
+                )
+            all_kept.extend(kept_batch)
+
+        log.info(
+            "ExtractExamplesTool: %d enriched, %d notes (provider=%s).",
+            len(all_kept), len(unresolved_log), provider_name,
+        )
+
         warnings.extend(unresolved_log[:20])
-        return ToolResult(ok=True, data=kept, warnings=warnings)
+        return ToolResult(ok=True, data=all_kept, warnings=warnings)

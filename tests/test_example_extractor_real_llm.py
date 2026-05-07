@@ -737,5 +737,313 @@ def test_full_pipeline_example_llm_fails_still_completes(
     assert orch.workspace.final_index_path().exists()
 
 
+# ---------------------------------------------------------------------------
+# Batching helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_example_chunks(n: int) -> list[ParsedChunk]:
+    """Return n ParsedChunks each of which triggers the heuristic extractor."""
+    return [
+        _chunk(
+            f"Example {i}: Compute value_{i} for the given parameters.",
+            chunk_id=f"c{i:03d}",
+        )
+        for i in range(n)
+    ]
+
+
+def _ids_from_batch_prompt(prompt: str) -> list[str]:
+    """Parse candidate IDs out of a `_build_user_prompt` string."""
+    marker = '{"example_candidates"'
+    start = prompt.find(marker)
+    if start == -1:
+        return []
+    try:
+        payload = json.loads(prompt[start:])
+        return [c["id"] for c in payload["example_candidates"]]
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+
+def _auto_patch_responder(prompt: str, _call_index: int) -> str:
+    """Valid response for any batch — reads IDs from the prompt."""
+    ids = _ids_from_batch_prompt(prompt)
+    return _valid_example_patch(ids) if ids else "{}"
+
+
+# ---------------------------------------------------------------------------
+# 20. Large batch is split: call count == ceil(N / batch_size)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_batching_call_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """52 examples with batch_size=8 → exactly ceil(52/8)=7 LLM calls."""
+    import math
+
+    monkeypatch.setenv("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", "8")
+    chunks = _make_example_chunks(52)
+    provider = _ScriptedProvider(responder=_auto_patch_responder)
+    result = ExtractExamplesTool().run(chunks=chunks, llm=provider)
+
+    assert result.ok
+    assert len(result.data) == 52
+    assert len(provider.calls) == math.ceil(52 / 8)
+
+
+# ---------------------------------------------------------------------------
+# 21. Failed batch is isolated — other batches succeed
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_one_failed_batch_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 2nd batch always returns invalid JSON; batches 1 and 3 succeed."""
+    monkeypatch.setenv("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", "5")
+    # 15 examples → 3 batches: [ex000..ex004], [ex005..ex009], [ex010..ex014]
+    chunks = _make_example_chunks(15)
+
+    def _responder(prompt: str, _call_index: int) -> str:
+        ids = _ids_from_batch_prompt(prompt)
+        if ids and ids[0] == "ex005":  # 2nd batch — always fail
+            return "not json at all"
+        return _valid_example_patch(ids) if ids else "{}"
+
+    provider = _ScriptedProvider(responder=_responder)
+    result = ExtractExamplesTool().run(chunks=chunks, llm=provider)
+
+    assert result.ok
+    assert len(result.data) == 15
+
+
+# ---------------------------------------------------------------------------
+# 22. All examples are present after mixed success / fallback
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_all_ids_present_after_mixed_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every input example appears exactly once in the output."""
+    monkeypatch.setenv("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", "4")
+    n = 20
+    chunks = _make_example_chunks(n)
+
+    fail_batch_first_id = "ex008"  # 3rd batch
+
+    def _responder(prompt: str, _call_index: int) -> str:
+        ids = _ids_from_batch_prompt(prompt)
+        if ids and ids[0] == fail_batch_first_id:
+            return "garbage"
+        return _valid_example_patch(ids) if ids else "{}"
+
+    provider = _ScriptedProvider(responder=_responder)
+    result = ExtractExamplesTool().run(chunks=chunks, llm=provider)
+
+    assert result.ok
+    output_ids = {e.id for e in result.data}
+    expected_ids = {f"ex{i:03d}" for i in range(n)}
+    assert output_ids == expected_ids
+
+
+# ---------------------------------------------------------------------------
+# 23. Successful batches carry enriched fields
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_successful_batches_enriched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Examples from successful batches have non-empty related_concepts."""
+    monkeypatch.setenv("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", "5")
+    chunks = _make_example_chunks(10)  # 2 batches, both succeed
+
+    provider = _ScriptedProvider(responder=_auto_patch_responder)
+    result = ExtractExamplesTool().run(chunks=chunks, llm=provider)
+
+    assert result.ok
+    for e in result.data:
+        assert e.related_concepts, f"{e.id} missing related_concepts after enrichment"
+
+
+# ---------------------------------------------------------------------------
+# 24. Failed batch examples carry the safe-fallback marker
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_failed_batch_has_fallback_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Examples from a failing batch have needs_review=True and the unavailable marker."""
+    monkeypatch.setenv("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", "4")
+    chunks = _make_example_chunks(8)  # 2 batches
+
+    fail_first_id = "ex004"  # 2nd batch
+
+    def _responder(prompt: str, _call_index: int) -> str:
+        ids = _ids_from_batch_prompt(prompt)
+        if ids and ids[0] == fail_first_id:
+            return "still garbage"
+        return _valid_example_patch(ids) if ids else "{}"
+
+    provider = _ScriptedProvider(responder=_responder)
+    result = ExtractExamplesTool().run(chunks=chunks, llm=provider)
+
+    assert result.ok
+    for e in result.data:
+        if e.id in {f"ex{i:03d}" for i in range(4, 8)}:
+            assert e.needs_review is True
+            assert any("llm_example_unavailable" in a for a in e.assumptions), (
+                f"{e.id} missing fallback marker"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 25. Retry within a batch (invalid JSON twice) only affects that batch
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_retry_failure_affects_only_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two invalid JSONs for one batch → safe fallback for that batch only."""
+    monkeypatch.setenv("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", "3")
+    chunks = _make_example_chunks(6)  # 2 batches: [ex000-ex002], [ex003-ex005]
+
+    fail_ids = {"ex000", "ex001", "ex002"}  # 1st batch
+
+    def _responder(prompt: str, _call_index: int) -> str:
+        ids = _ids_from_batch_prompt(prompt)
+        if ids and ids[0] == "ex000":
+            return "{{bad json"  # always bad for this batch
+        return _valid_example_patch(ids) if ids else "{}"
+
+    provider = _ScriptedProvider(responder=_responder)
+    result = ExtractExamplesTool().run(chunks=chunks, llm=provider)
+
+    assert result.ok
+    assert len(result.data) == 6
+    for e in result.data:
+        if e.id in fail_ids:
+            assert any("llm_example_unavailable" in a for a in e.assumptions)
+        else:
+            assert e.related_concepts  # enriched successfully
+
+
+# ---------------------------------------------------------------------------
+# 26. Provider exception on one batch only affects that batch
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_provider_exception_isolated_to_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RuntimeError from provider on 1st batch → fallback there; 2nd batch succeeds."""
+    monkeypatch.setenv("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", "4")
+    chunks = _make_example_chunks(8)  # 2 batches
+
+    call_counter = {"n": 0}
+
+    def _responder(prompt: str, _call_index: int) -> str:
+        call_counter["n"] += 1
+        if call_counter["n"] == 1:
+            raise RuntimeError("simulated timeout on 1st batch")
+        ids = _ids_from_batch_prompt(prompt)
+        return _valid_example_patch(ids) if ids else "{}"
+
+    provider = _ScriptedProvider(responder=_responder)
+    result = ExtractExamplesTool().run(chunks=chunks, llm=provider)
+
+    assert result.ok
+    assert len(result.data) == 8
+    first_batch_ids = {f"ex{i:03d}" for i in range(4)}
+    for e in result.data:
+        if e.id in first_batch_ids:
+            assert any("llm_example_unavailable" in a for a in e.assumptions)
+        else:
+            assert e.related_concepts
+
+
+# ---------------------------------------------------------------------------
+# 27. STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE env var is honoured
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_batch_size_env_var_honoured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batch size of 4 → ceil(12/4)=3 LLM calls; batch size of 6 → ceil(12/6)=2."""
+    import math
+
+    chunks = _make_example_chunks(12)
+
+    for size, expected_calls in [(4, 3), (6, 2)]:
+        monkeypatch.setenv("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", str(size))
+        provider = _ScriptedProvider(responder=_auto_patch_responder)
+        result = ExtractExamplesTool().run(chunks=chunks, llm=provider)
+        assert result.ok
+        assert len(result.data) == 12
+        assert len(provider.calls) == math.ceil(12 / size), (
+            f"batch_size={size}: expected {math.ceil(12/size)} calls, "
+            f"got {len(provider.calls)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 28. Invalid STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE falls back to default (8)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_invalid_batch_size_falls_back_to_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-integer env var → default batch size of 8."""
+    import math
+
+    monkeypatch.setenv("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", "not_a_number")
+    chunks = _make_example_chunks(16)
+    provider = _ScriptedProvider(responder=_auto_patch_responder)
+    result = ExtractExamplesTool().run(chunks=chunks, llm=provider)
+    assert result.ok
+    assert len(result.data) == 16
+    # Default batch_size=8 → ceil(16/8)=2 calls
+    assert len(provider.calls) == math.ceil(16 / 8)
+
+
+# ---------------------------------------------------------------------------
+# 29. Full pipeline with fake batched examples still completes
+# ---------------------------------------------------------------------------
+
+
+def test_extract_examples_full_pipeline_batched(
+    sample_course_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pipeline completes end-to-end with batched LLM enrichment."""
+    from stem_learning_agent.agents.curriculum_mapper_agent import CurriculumMapperAgent
+    from stem_learning_agent.agents.example_tutor_agent import ExampleTutorAgent
+    from stem_learning_agent.agents.material_parser_agent import MaterialParserAgent
+
+    monkeypatch.setenv("STEM_AGENT_EXAMPLE_LLM_BATCH_SIZE", "2")
+
+    cfg = RunConfig(course_path=sample_course_path)
+    orch = Orchestrator(cfg)
+    orch.init()
+    MaterialParserAgent().run(orch.ctx)
+    CurriculumMapperAgent().run(orch.ctx)
+
+    orch.ctx.llm = _ScriptedProvider(responder=_auto_patch_responder)
+    ExampleTutorAgent().run(orch.ctx)
+
+    examples_path = CourseWorkspace(sample_course_path).examples_path()
+    assert examples_path.exists()
+    raw = json.loads(examples_path.read_text(encoding="utf-8"))
+    assert isinstance(raw, list)
+    assert len(raw) > 0
+
+
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])

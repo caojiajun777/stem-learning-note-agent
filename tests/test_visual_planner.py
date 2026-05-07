@@ -305,6 +305,138 @@ def test_no_network_no_api_key() -> None:
     assert "API_KEY" not in source
 
 
+# ---------------------------------------------------------------------------
+# 13-17. Control-systems visual rules — no RC pollution (Task C)
+# ---------------------------------------------------------------------------
+
+
+def _write_control_parts(workspace, parts_data: list[dict]) -> None:
+    """Write a custom part_outline.json for control-systems tests."""
+    from stem_learning_agent.core import io_utils
+    from stem_learning_agent.core.schemas import LearningPart, PartOutline, SourceRef
+
+    parts = [
+        LearningPart(
+            id=p["id"],
+            title=p["title"],
+            core_question=p.get("cq", f"What is {p['title']}?"),
+            concepts=p.get("concepts", []),
+            learning_objectives=p.get("objectives", []),
+            source_refs=[SourceRef(material_id="slides", chunk_id=f"c{p['id']}")],
+            confidence=0.65,
+        )
+        for p in parts_data
+    ]
+    io_utils.write_json(
+        workspace.part_outline_path(),
+        PartOutline(parts=parts).model_dump(),
+    )
+
+
+def test_rc_part_still_triggers_circuit_diagram(sample_course_path: Path) -> None:
+    """A part with RC circuit keywords must still produce a circuit_state_diagram."""
+    orch = _run_up_to_visual(sample_course_path)
+    _write_control_parts(orch.workspace, [
+        {
+            "id": "001",
+            "title": "RC Low-Pass Filter Circuit",
+            "cq": "How does the RC circuit work?",
+            "concepts": ["rc circuit", "resistor", "capacitor", "low-pass filter"],
+        }
+    ])
+    _run_visual_and_packager(orch)
+    data = _load_visual_needs(orch)
+    kinds = {item["kind"] for item in data["items"]}
+    assert "circuit_state_diagram" in kinds, (
+        f"RC part must trigger circuit_state_diagram; got {sorted(kinds)}"
+    )
+
+
+def test_control_system_without_rc_no_circuit_diagram(sample_course_path: Path) -> None:
+    """A generic control systems part must NOT trigger the RC circuit diagram."""
+    orch = _run_up_to_visual(sample_course_path)
+    _write_control_parts(orch.workspace, [
+        {
+            "id": "001",
+            "title": "Closed-Loop Control System Performance",
+            "cq": "How do we specify closed-loop performance?",
+            "concepts": [
+                "feedback control", "closed loop", "transfer function",
+                "stability", "steady-state error", "pid controller",
+            ],
+        }
+    ])
+    _run_visual_and_packager(orch)
+    data = _load_visual_needs(orch)
+    circuit_items = [
+        item for item in data["items"] if item["kind"] == "circuit_state_diagram"
+    ]
+    assert not circuit_items, (
+        "A control systems part without RC/resistor/capacitor keywords must NOT "
+        f"trigger circuit_state_diagram; got {circuit_items}"
+    )
+
+
+def test_root_locus_title_triggers_root_locus_plot(sample_course_path: Path) -> None:
+    """A part containing 'root locus' keywords must produce a root_locus_plot visual."""
+    orch = _run_up_to_visual(sample_course_path)
+    _write_control_parts(orch.workspace, [
+        {
+            "id": "001",
+            "title": "Root Locus Design",
+            "cq": "How does root locus guide controller design?",
+            "concepts": ["root locus", "closed-loop pole", "pole movement", "gain"],
+        }
+    ])
+    _run_visual_and_packager(orch)
+    data = _load_visual_needs(orch)
+    kinds = {item["kind"] for item in data["items"]}
+    assert "root_locus_plot" in kinds, (
+        f"root locus part must trigger root_locus_plot; got {sorted(kinds)}"
+    )
+
+
+def test_z_transform_part_triggers_z_plane_mapping(sample_course_path: Path) -> None:
+    """A part about z-transform/s-to-z mapping triggers z_plane_mapping visual."""
+    orch = _run_up_to_visual(sample_course_path)
+    _write_control_parts(orch.workspace, [
+        {
+            "id": "001",
+            "title": "S-to-Z Mapping and Digital Poles",
+            "cq": "How do s-plane poles map to the z-plane?",
+            "concepts": ["z-transform", "s-to-z", "z plane", "digital poles", "unit circle"],
+        }
+    ])
+    _run_visual_and_packager(orch)
+    data = _load_visual_needs(orch)
+    kinds = {item["kind"] for item in data["items"]}
+    assert "z_plane_mapping" in kinds, (
+        f"z-transform/s-to-z part must trigger z_plane_mapping; got {sorted(kinds)}"
+    )
+
+
+def test_closed_loop_spec_triggers_step_response(sample_course_path: Path) -> None:
+    """A part about closed-loop specs (overshoot, settling time) triggers step_response visual."""
+    orch = _run_up_to_visual(sample_course_path)
+    _write_control_parts(orch.workspace, [
+        {
+            "id": "001",
+            "title": "Closed-Loop Specifications and Transient Performance",
+            "cq": "How do we interpret transient response specs?",
+            "concepts": [
+                "overshoot", "settling time", "rise time",
+                "transient response", "closed-loop spec",
+            ],
+        }
+    ])
+    _run_visual_and_packager(orch)
+    data = _load_visual_needs(orch)
+    kinds = {item["kind"] for item in data["items"]}
+    assert "step_response" in kinds, (
+        f"closed-loop spec part must trigger step_response; got {sorted(kinds)}"
+    )
+
+
 if __name__ == "__main__":  # pragma: no cover
     import pytest
 
