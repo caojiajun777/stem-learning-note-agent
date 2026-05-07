@@ -49,13 +49,10 @@ def _infer_title_from_material_id(material_id: str) -> str:
     cleaned = re.sub(r"[_\-]+", " ", cleaned)
     # Collapse multiple spaces.
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
-    # Remove trailing year/date patterns like "2526", "2324".
-    # Standalone years like "2526", "2025"
-    cleaned = re.sub(r"\b\d{4}\b", "", cleaned).strip()
-    # Years attached to words like "2324blank", "2526annotated"
-    cleaned = re.sub(r"\b\d{4}[a-zA-Z]+\b", "", cleaned).strip()
-    # Remove "annotated", "blank" annotations.
-    cleaned = re.sub(r"\b(annotated|blank)\b", "", cleaned, flags=re.IGNORECASE).strip()
+    # Remove trailing year/date patterns like "2526", "2324", and attached noise.
+    cleaned = re.sub(r"\b\d{4}[a-zA-Z]*\b", "", cleaned).strip()
+    # Remove noise tokens.
+    cleaned = re.sub(r"\b(annotated|blank|unnc)\b", "", cleaned, flags=re.IGNORECASE).strip()
     # Collapse spaces again.
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return cleaned if cleaned else material_id

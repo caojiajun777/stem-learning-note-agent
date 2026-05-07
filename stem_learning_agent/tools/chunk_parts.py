@@ -9,6 +9,7 @@ Two paths:
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Optional
 
 from ..harness.tool_base import Tool, ToolResult
@@ -36,6 +37,175 @@ _KEYWORD_RE = re.compile(
     r"rise\s*time|damping\s*ratio|natural\s*frequency|"
     r"proportional|integral|derivative|controller\s*design)"
 )
+
+
+# ---------------------------------------------------------------------------
+# Title quality filter
+# ---------------------------------------------------------------------------
+
+_MATH_UNICODE_RE = re.compile(
+    r"[Α-ω"          # Greek letters
+    r"∀-⋿"           # Mathematical operators
+    r"⨀-⫿"           # Supplemental math operators
+    r"ᵀ0-ᵿF"         # Mathematical Alphanumeric Symbols (surrogate range)
+    r"×÷"            # × and ÷
+    r"√∫∑∏"  # √ ∫ ∑ ∏
+    r"→←⇒"      # arrows
+    r"∑∞=−∈∉∀∃∂∇]+"
+)
+
+_COORD_PATTERN_RE = re.compile(
+    r"(?:^|\s)\d+\s*[TtkK]\s+\d+\s*[TtkK]"  # coordinate axis tokens like "0 T 2T 3T"
+    r"|f\s*\(\s*[knt]\s*\)"                   # f(k), f(n), f(t)
+    r"|[knt]\s*→\s*[knt]"                     # discrete-time axis labels
+)
+
+_NOISE_WORDS = frozenset({
+    "unnc", "annotated", "blank", "2526", "2425", "2324", "2223",
+})
+
+
+def _unicode_math_density(text: str) -> float:
+    """Fraction of characters that are Unicode math symbols."""
+    if not text:
+        return 0.0
+    math_chars = sum(
+        1 for ch in text
+        if unicodedata.category(ch) in ("Sm", "So", "Sk")
+        or ch in "∑∞=−∈∉∀∃∂∇√∫∏→←⇒αβγδεζηθικλμνξπρστυφχψω"
+    )
+    return math_chars / len(text)
+
+
+def _is_bad_title(text: str) -> bool:
+    """Return True when *text* should NOT be used as a part title.
+
+    Criteria (any one is sufficient):
+    1. Contains multi-line content (newlines → garbled graph text).
+    2. Excessive Unicode math glyphs (>10 % of characters).
+    3. Matches coordinate-axis patterns (e.g. "0 T 2T 3T").
+    4. Too short (<2 words) or purely numeric/symbolic (no natural-language word ≥3 chars).
+    5. Too long (>14 words) — likely a paragraph, not a heading.
+    """
+    if not text or not text.strip():
+        return True
+    stripped = text.strip()
+
+    # 1. Multi-line
+    if "\n" in stripped:
+        return True
+
+    # 2. Unicode math density
+    if _unicode_math_density(stripped) > 0.10:
+        return True
+
+    # 3. Coordinate axis pattern
+    if _COORD_PATTERN_RE.search(stripped):
+        return True
+
+    words = stripped.split()
+
+    # 4. Fewer than 2 words or no natural-language word of length ≥ 3
+    if len(words) < 2:
+        return True
+    natural_words = [w for w in words if re.fullmatch(r"[A-Za-z]{3,}", w)]
+    if not natural_words:
+        return True
+
+    # 5. Too long (paragraph)
+    if len(words) > 14:
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Filename-stem title cleaning
+# ---------------------------------------------------------------------------
+
+# Noise tokens stripped from filename stems (course-specific).
+_NOISE_SUFFIXES_RE = re.compile(
+    r"\b(unnc|annotated|blank|2526|2425|2324|2223|2122)\b",
+    flags=re.IGNORECASE,
+)
+
+# "Ztransform" / "ztransform" → "Z-Transform"
+_ZTRANSFORM_RE = re.compile(r"\bz[\s\-]?transform\b", re.IGNORECASE)
+# "ZTF" / "Z TF" → "Z Transfer Function"
+_ZTF_RE = re.compile(r"\bZ[\s\-]?TF\b")
+
+
+def _clean_filename_title(stem: str) -> str:
+    """Convert a raw filename stem into a clean human-readable title.
+
+    Rules (in order):
+    1. Replace underscores/hyphens with spaces.
+    2. Remove noise tokens (UNNC, annotated, blank, year codes like 2526).
+    3. Normalise Z-transform spellings.
+    4. Collapse repeated spaces.
+    5. Return stripped result; fall back to original stem if empty.
+    """
+    t = stem.strip()
+    t = re.sub(r"[_\-]+", " ", t)
+    # Remove trailing 4-digit year patterns and attached noise like "2526annotated"
+    t = re.sub(r"\b\d{4}[a-zA-Z]*\b", "", t)
+    t = _NOISE_SUFFIXES_RE.sub("", t)
+    t = _ZTRANSFORM_RE.sub("Z-Transform", t)
+    t = _ZTF_RE.sub("Z Transfer Functions", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t if t else stem
+
+
+# ---------------------------------------------------------------------------
+# Core question generator
+# ---------------------------------------------------------------------------
+
+_CORE_QUESTION_RULES: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"z[\s\-]?transform", re.IGNORECASE),
+        "How does the z-transform represent sampled signals and digital transfer functions?",
+    ),
+    (
+        re.compile(r"root\s*locus", re.IGNORECASE),
+        "How does the root locus describe closed-loop pole movement and guide controller design?",
+    ),
+    (
+        re.compile(r"bode", re.IGNORECASE),
+        "How do Bode plots describe frequency response and stability margins?",
+    ),
+    (
+        re.compile(r"state\s*space", re.IGNORECASE),
+        "How does state-space representation model dynamic system behaviour?",
+    ),
+    (
+        re.compile(r"pid|proportional.*integral|integral.*derivative", re.IGNORECASE),
+        "How does PID control improve system response through proportional, integral, and derivative action?",
+    ),
+    (
+        re.compile(r"nyquist|phase\s*margin|gain\s*margin|frequency\s*response", re.IGNORECASE),
+        "How do frequency-domain methods assess closed-loop stability and robustness?",
+    ),
+    (
+        re.compile(r"s[\-\s]domain|laplace|transfer\s*function", re.IGNORECASE),
+        "How does the s-domain transfer function characterise system dynamics in continuous time?",
+    ),
+    (
+        re.compile(r"digital\s*control|discrete|sampled", re.IGNORECASE),
+        "How are continuous-time control techniques adapted for discrete-time digital implementation?",
+    ),
+    (
+        re.compile(r"control\s*system|feedback|closed\s*loop|open\s*loop", re.IGNORECASE),
+        "What are the basic ideas and design goals of feedback control systems?",
+    ),
+]
+
+
+def _core_question_from_title(title: str) -> str:
+    """Return a meaningful core question based on keywords in *title*."""
+    for pattern, question in _CORE_QUESTION_RULES:
+        if pattern.search(title):
+            return question
+    return f"What are the main concepts introduced in '{title}'?"
 
 
 def _concepts_from_text(text: str) -> list[str]:
@@ -81,21 +251,35 @@ def _clean_title(raw: str) -> str:
 
 
 def _title_from_document(doc: ParsedDocument) -> str:
-    """Infer a part title from a parsed document."""
-    # Prefer first non-empty heading-like chunk.
-    for c in doc.chunks[:5]:
+    """Infer a part title from a parsed document.
+
+    Priority cascade:
+    A. First chunk with a clean heading-like text (passes _is_bad_title filter).
+    B. Cleaned filename stem from material_id.
+    C. material_id as-is.
+    """
+    # A. Try the first few chunks for a clean, usable heading.
+    for c in doc.chunks[:8]:
         text = c.text.strip()
         if not text:
             continue
-        # A plausible heading: ≤120 chars, no trailing period, contains
-        # a keyword or starts with a capitalized word or course code.
+        if _is_bad_title(text):
+            continue
+        # Must be ≤120 chars and either contain a keyword or start with
+        # a capitalised word with at least 2 words total.
         if len(text) <= 120 and not text.endswith("."):
             if _KEYWORD_RE.search(text) or (
                 text[0].isupper() and len(text.split()) >= 2
             ):
                 return text
-    # Fall back to a cleaned material_id.
-    return _clean_title(doc.material_id)
+
+    # B. Clean the filename stem.
+    cleaned = _clean_filename_title(doc.material_id)
+    if cleaned and not _is_bad_title(cleaned):
+        return cleaned
+
+    # C. Last resort: raw material_id.
+    return doc.material_id
 
 
 def _first_page_line(doc: ParsedDocument) -> str:
@@ -136,7 +320,8 @@ def chunk_per_document_fallback(
             refs.append(SourceRef(material_id=doc.material_id, page=1))
 
         unresolved: list[str] = []
-        if title == _clean_title(doc.material_id):
+        filename_title = _clean_filename_title(doc.material_id)
+        if title == filename_title or title == doc.material_id:
             unresolved.append(
                 "title inferred from filename; verify against document content"
             )
@@ -148,10 +333,12 @@ def chunk_per_document_fallback(
         else:
             confidence = 0.65
 
+        core_question = _core_question_from_title(title)
+
         part = LearningPart(
             id=f"{i:03d}",
             title=title,
-            core_question=f"What does '{title}' cover?",
+            core_question=core_question,
             source_refs=refs,
             concepts=concepts,
             learning_objectives=[
