@@ -39,3 +39,8 @@ samples/*/review/
 samples/*/final/
 samples/*/memory/
 samples/*/pipeline_run.json
+
+# Local lecture-note live-test corpora and generated artifacts
+/lecture_note_test/
+/samples/lecture_note_test/
+/samples/lecture_note_llm_smoke/
