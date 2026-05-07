@@ -70,20 +70,7 @@ Given a folder of raw course materials (Markdown / TXT in this MVP), the pipelin
 
 ### Pipeline flow
 
-```mermaid
-flowchart LR
-    A[raw/ materials] --> B[MaterialParser]
-    B --> C[CurriculumMapper]
-    C --> D[PrerequisiteAgent]
-    C --> E[FormulaAgent]
-    C --> F[ExampleTutorAgent]
-    D & E & F --> G[VisualPlannerAgent]
-    D & E & F --> H[PartTutorAgent]
-    H --> I[ReviewerAgent]
-    I --> J[FixerAgent]
-    G & J --> K[PackagerAgent]
-    K --> L[final/ artefacts]
-```
+![Pipeline Architecture](docs/pipeline_architecture.png)
 
 ### Workspace layout
 
